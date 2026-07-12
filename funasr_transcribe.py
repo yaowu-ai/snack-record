@@ -1,14 +1,31 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import re
 from pathlib import Path
 
 from funasr import AutoModel
 
-MODEL_ID = "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
-VAD_MODEL_ID = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-PUNC_MODEL_ID = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
-SPEAKER_MODEL_ID = "iic/speech_campplus_sv_zh-cn_16k-common"
+MODEL_NAMES = (
+    "iic--speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+    "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    "iic--punc_ct-transformer_cn-en-common-vocab471067-large",
+    "iic--speech_campplus_sv_zh-cn_16k-common",
+)
+
+
+def local_model_directories() -> tuple[Path, Path, Path, Path]:
+    cache_root = Path(
+        os.environ.get("MODELSCOPE_CACHE", Path.home() / ".cache" / "modelscope")
+    ).expanduser()
+    directories = tuple(
+        cache_root / "models" / model_name / "snapshots" / "master"
+        for model_name in MODEL_NAMES
+    )
+    missing = [str(directory) for directory in directories if not directory.is_dir()]
+    if missing:
+        raise RuntimeError("Local FunASR models are unavailable: " + ", ".join(missing))
+    return directories
 
 
 def normalize_text(text: str) -> str:
@@ -30,11 +47,13 @@ def main() -> None:
     parser.add_argument("start_time")
     args = parser.parse_args()
 
+    model, vad_model, punc_model, speaker_model = local_model_directories()
+
     model = AutoModel(
-        model=MODEL_ID,
-        vad_model=VAD_MODEL_ID,
-        punc_model=PUNC_MODEL_ID,
-        spk_model=SPEAKER_MODEL_ID,
+        model=str(model),
+        vad_model=str(vad_model),
+        punc_model=str(punc_model),
+        spk_model=str(speaker_model),
         disable_update=True,
     )
     results = model.generate(input=str(args.input), batch_size_s=300)

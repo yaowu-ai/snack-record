@@ -13,6 +13,21 @@ static NSString *PythonExecutablePath(void) {
     return [[SnackRecordApplicationSupportURL() URLByAppendingPathComponent:@"Runtime/venv/bin/python"] path];
 }
 
+static BOOL HasCompleteModelCacheAtPath(NSString *cachePath) {
+    NSArray<NSString *> *models = @[
+        @"iic--speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        @"iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        @"iic--punc_ct-transformer_cn-en-common-vocab471067-large",
+        @"iic--speech_campplus_sv_zh-cn_16k-common"
+    ];
+    for (NSString *model in models) {
+        NSString *configuration = [cachePath stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"models/%@/snapshots/master/configuration.json", model]];
+        if (![NSFileManager.defaultManager fileExistsAtPath:configuration]) return NO;
+    }
+    return YES;
+}
+
 static NSString *FFmpegExecutablePath(void) {
     for (NSString *candidate in @[@"/opt/homebrew/bin/ffmpeg", @"/usr/local/bin/ffmpeg", @"/usr/bin/ffmpeg"]) {
         if ([NSFileManager.defaultManager isExecutableFileAtPath:candidate]) return candidate;
@@ -862,7 +877,12 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
         task.executableURL = [NSURL fileURLWithPath:pythonExecutable];
         task.arguments = @[script, job.recordingURL.path, job.temporaryOutputURL.path, [startFormatter stringFromDate:job.startDate]];
         NSMutableDictionary<NSString *, NSString *> *environment = [NSProcessInfo.processInfo.environment mutableCopy];
-        environment[@"MODELSCOPE_CACHE"] = [[SnackRecordApplicationSupportURL() URLByAppendingPathComponent:@"Models"] path];
+        NSString *modelCache = [[SnackRecordApplicationSupportURL() URLByAppendingPathComponent:@"Models"] path];
+        if (HasCompleteModelCacheAtPath(modelCache)) {
+            environment[@"MODELSCOPE_CACHE"] = modelCache;
+        } else {
+            [environment removeObjectForKey:@"MODELSCOPE_CACHE"];
+        }
         task.environment = environment;
         task.standardError = [NSPipe pipe];
         if (job.cancelled) return;
