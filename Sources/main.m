@@ -204,6 +204,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 - (void)applyInterfaceLanguage:(NSString *)language;
 - (void)applyTranscriptionMode:(NSString *)mode;
 - (void)preloadModels;
+- (void)transcribeJob:(TranscriptionJob *)job;
 - (void)shutdownWorker;
 @end
 
@@ -224,6 +225,9 @@ static NSString *const TranscriptionModeStandard = @"standard";
         [self configureRecordingPanel];
         [self renderState:TranscriptionStateReady message:nil];
         [self preloadModels];
+        for (TranscriptionJob *job in self.jobs) {
+            if (job.state == TranscriptionJobStateQueued) [self transcribeJob:job];
+        }
     }
     return self;
 }
@@ -257,7 +261,16 @@ static NSString *const TranscriptionModeStandard = @"standard";
             ? TranscriptionModeStandard
             : TranscriptionModeFast;
         NSInteger storedState = [stored[@"state"] integerValue];
-        job.state = storedState == TranscriptionJobStateFinished ? TranscriptionJobStateFinished : TranscriptionJobStateFailed;
+        BOOL canResume = [NSFileManager.defaultManager fileExistsAtPath:job.recordingURL.path];
+        if (storedState == TranscriptionJobStateFinished) {
+            job.state = TranscriptionJobStateFinished;
+        } else if ((storedState == TranscriptionJobStateQueued || storedState == TranscriptionJobStateProcessing) && canResume) {
+            job.state = TranscriptionJobStateQueued;
+            job.temporaryOutputURL = [[job.recordingURL URLByDeletingLastPathComponent]
+                URLByAppendingPathComponent:[NSString stringWithFormat:@"result-%@.txt", NSUUID.UUID.UUIDString]];
+        } else {
+            job.state = TranscriptionJobStateFailed;
+        }
         job.filenameField = [[NSTextField alloc] init];
         NSString *filename = stored[@"filename"];
         job.filenameField.stringValue = [filename isKindOfClass:NSString.class] ? filename : [self defaultFilenameForDate:job.startDate];
@@ -924,7 +937,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
             [self.modelWorkerReadBuffer replaceBytesInRange:NSMakeRange(0, NSMaxRange(newline)) withBytes:NULL length:0];
             return [[NSString alloc] initWithData:lineData encoding:NSUTF8StringEncoding];
         }
-        NSData *chunk = [self.modelWorkerOutput readDataOfLength:4096];
+        NSData *chunk = self.modelWorkerOutput.availableData;
         if (chunk.length == 0) return nil;
         [self.modelWorkerReadBuffer appendData:chunk];
     }
