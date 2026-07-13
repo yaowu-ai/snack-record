@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <AVFoundation/AVFoundation.h>
+#import <Carbon/Carbon.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <UserNotifications/UserNotifications.h>
@@ -1222,7 +1223,26 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
 @property(nonatomic, strong) NSMenuItem *chineseInterfaceItem;
 @property(nonatomic, copy) NSString *interfaceLanguage;
 @property(nonatomic, strong) id shortcutMonitor;
+@property(nonatomic) EventHotKeyRef recordingHotKey;
+@property(nonatomic) EventHandlerRef hotKeyEventHandler;
+- (void)handleGlobalRecordingShortcut;
 @end
+
+static const OSType SnackRecordHotKeySignature = 'SnRc';
+static const UInt32 SnackRecordHotKeyIdentifier = 1;
+
+static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRef event, void *userData) {
+    EventHotKeyID hotKeyID = {0};
+    OSStatus status = GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID,
+                                        NULL, sizeof(hotKeyID), NULL, &hotKeyID);
+    if (status == noErr && hotKeyID.signature == SnackRecordHotKeySignature &&
+        hotKeyID.id == SnackRecordHotKeyIdentifier) {
+        AppDelegate *delegate = (__bridge AppDelegate *)userData;
+        dispatch_async(dispatch_get_main_queue(), ^{ [delegate handleGlobalRecordingShortcut]; });
+        return noErr;
+    }
+    return CallNextEventHandler(nextHandler, event);
+}
 
 @implementation AppDelegate
 
@@ -1259,6 +1279,20 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
 }
 
 - (void)configureShortcut {
+    EventTypeSpec eventType = {kEventClassKeyboard, kEventHotKeyPressed};
+    OSStatus handlerStatus = InstallApplicationEventHandler(&HandleSnackRecordHotKey, 1, &eventType,
+                                                             (__bridge void *)self, &_hotKeyEventHandler);
+    EventHotKeyID hotKeyID = {SnackRecordHotKeySignature, SnackRecordHotKeyIdentifier};
+    OSStatus registrationStatus = handlerStatus == noErr
+        ? RegisterEventHotKey(kVK_ANSI_R, controlKey, hotKeyID, GetApplicationEventTarget(),
+                              0, &_recordingHotKey)
+        : handlerStatus;
+    if (registrationStatus == noErr) return;
+
+    if (self.hotKeyEventHandler) {
+        RemoveEventHandler(self.hotKeyEventHandler);
+        self.hotKeyEventHandler = NULL;
+    }
     __weak typeof(self) weakSelf = self;
     self.shortcutMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
         NSEventModifierFlags modifiers = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
@@ -1269,6 +1303,10 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
         }
         return event;
     }];
+}
+
+- (void)handleGlobalRecordingShortcut {
+    [self.controller startRecordingIfNeeded];
 }
 
 - (NSImage *)menuBarTemplateIcon {
@@ -1390,6 +1428,8 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
 - (void)applicationDidBecomeActive:(NSNotification *)notification { [self.controller refreshMicrophoneAuthorization]; }
 - (void)applicationWillTerminate:(NSNotification *)notification {
     if (self.shortcutMonitor) [NSEvent removeMonitor:self.shortcutMonitor];
+    if (self.recordingHotKey) UnregisterEventHotKey(self.recordingHotKey);
+    if (self.hotKeyEventHandler) RemoveEventHandler(self.hotKeyEventHandler);
 }
 
 @end
