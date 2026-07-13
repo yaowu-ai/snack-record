@@ -4,6 +4,7 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <UserNotifications/UserNotifications.h>
+#include <math.h>
 
 static NSURL *SnackRecordApplicationSupportURL(void) {
     NSURL *applicationSupport = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
@@ -105,6 +106,9 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     TranscriptionJobStateFailed,
 };
 
+static NSString *const TranscriptionModeFast = @"fast";
+static NSString *const TranscriptionModeStandard = @"standard";
+
 @interface FlippedView : NSView
 @end
 
@@ -134,6 +138,11 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
 @property(nonatomic, strong) NSDate *startDate;
 @property(nonatomic, strong) NSTask *task;
 @property(nonatomic) TranscriptionJobState state;
+@property(nonatomic, copy) NSString *transcriptionMode;
+@property(nonatomic) double progress;
+@property(nonatomic, strong) NSDate *progressStartedAt;
+@property(nonatomic, strong) NSDate *estimationStartedAt;
+@property(nonatomic) double estimationStartProgress;
 @property(nonatomic, strong) NSView *rowView;
 @property(nonatomic, strong) NSTextField *filenameField;
 @property(nonatomic, strong) NSTextField *stateLabel;
@@ -179,6 +188,7 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
 @property(nonatomic, strong) NSURL *jobsMetadataURL;
 @property(nonatomic) dispatch_queue_t transcriptionQueue;
 @property(nonatomic) TranscriptionState currentState;
+@property(nonatomic, copy) NSString *transcriptionMode;
 @property(nonatomic) BOOL waitingForMicrophonePermission;
 @property(nonatomic, copy) void (^stateDidChange)(TranscriptionState state);
 - (void)toggleRecording;
@@ -188,6 +198,7 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
 - (BOOL)hasPendingTranscriptions;
 - (void)cancelTranscriptions;
 - (void)applyInterfaceLanguage:(NSString *)language;
+- (void)applyTranscriptionMode:(NSString *)mode;
 @end
 
 @implementation TranscriptionController
@@ -197,6 +208,7 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     if (self) {
         _audioEngine = [[AVAudioEngine alloc] init];
         _interfaceLanguage = @"en";
+        _transcriptionMode = TranscriptionModeFast;
         _jobs = [NSMutableArray array];
         _transcriptionQueue = dispatch_queue_create("local.snack-record.transcription", DISPATCH_QUEUE_SERIAL);
         _screenAudioQueue = dispatch_queue_create("local.snack-record.system-audio", DISPATCH_QUEUE_SERIAL);
@@ -233,6 +245,10 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
         NSString *outputPath = stored[@"outputPath"];
         if ([outputPath isKindOfClass:NSString.class] && outputPath.length > 0) job.finalOutputURL = [NSURL fileURLWithPath:outputPath];
         job.startDate = [stored[@"startDate"] isKindOfClass:NSDate.class] ? stored[@"startDate"] : NSDate.date;
+        NSString *storedMode = stored[@"transcriptionMode"];
+        job.transcriptionMode = [storedMode isEqualToString:TranscriptionModeStandard]
+            ? TranscriptionModeStandard
+            : TranscriptionModeFast;
         NSInteger storedState = [stored[@"state"] integerValue];
         job.state = storedState == TranscriptionJobStateFinished ? TranscriptionJobStateFinished : TranscriptionJobStateFailed;
         job.filenameField = [[NSTextField alloc] init];
@@ -253,6 +269,7 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
             @"filename": job.filenameField.stringValue ?: @"",
             @"startDate": job.startDate ?: NSDate.date,
             @"state": @(job.state),
+            @"transcriptionMode": job.transcriptionMode ?: TranscriptionModeFast,
         }];
     }
     [storedJobs writeToURL:self.jobsMetadataURL atomically:YES];
@@ -286,6 +303,12 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     self.clearJobsButton.toolTip = [self english:@"Clear transcription tasks" chinese:@"清空转写任务"];
     [self rebuildJobsView];
     [self renderState:self.currentState message:nil];
+}
+
+- (void)applyTranscriptionMode:(NSString *)mode {
+    self.transcriptionMode = [mode isEqualToString:TranscriptionModeStandard]
+        ? TranscriptionModeStandard
+        : TranscriptionModeFast;
 }
 
 - (void)configureWindow {
@@ -829,6 +852,8 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     job.recordingURL = recordingURL;
     job.startDate = startDate;
     job.state = TranscriptionJobStateQueued;
+    job.transcriptionMode = self.transcriptionMode ?: TranscriptionModeFast;
+    job.progress = 0.0;
     job.temporaryOutputURL = [[job.recordingURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:[NSString stringWithFormat:@"result-%@.txt", NSUUID.UUID.UUIDString]];
     job.filenameField = [[NSTextField alloc] init];
     job.filenameField.stringValue = suggestedFilename ?: [self defaultFilenameForDate:job.startDate];
@@ -849,12 +874,28 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     return [NSString stringWithFormat:@"Snack Record-%@.txt", [formatter stringFromDate:date]];
 }
 
+- (void)updateProgress:(double)progress forJob:(TranscriptionJob *)job {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (job.cancelled || job.state != TranscriptionJobStateProcessing) return;
+        job.progress = MAX(job.progress, MIN(100.0, progress));
+        if (!job.estimationStartedAt && job.progress >= 8.0) {
+            job.estimationStartedAt = NSDate.date;
+            job.estimationStartProgress = job.progress;
+        }
+        [self updateJobRow:job];
+    });
+}
+
 - (void)transcribeJob:(TranscriptionJob *)job {
     dispatch_async(self.transcriptionQueue, ^{
         if (job.cancelled) return;
         dispatch_async(dispatch_get_main_queue(), ^{
             if (job.cancelled) return;
             job.state = TranscriptionJobStateProcessing;
+            job.progress = 0.0;
+            job.progressStartedAt = NSDate.date;
+            job.estimationStartedAt = nil;
+            job.estimationStartProgress = 0.0;
             [self updateJobRow:job];
             [self persistJobs];
         });
@@ -876,7 +917,11 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
 
         NSTask *task = [[NSTask alloc] init];
         task.executableURL = [NSURL fileURLWithPath:pythonExecutable];
-        task.arguments = @[script, job.recordingURL.path, job.temporaryOutputURL.path, [startFormatter stringFromDate:job.startDate]];
+        NSString *mode = [job.transcriptionMode isEqualToString:TranscriptionModeStandard]
+            ? TranscriptionModeStandard
+            : TranscriptionModeFast;
+        task.arguments = @[script, job.recordingURL.path, job.temporaryOutputURL.path,
+                           [startFormatter stringFromDate:job.startDate], @"--mode", mode];
         NSMutableDictionary<NSString *, NSString *> *environment = [NSProcessInfo.processInfo.environment mutableCopy];
         NSString *modelCache = [[SnackRecordApplicationSupportURL() URLByAppendingPathComponent:@"Models"] path];
         if (HasCompleteModelCacheAtPath(modelCache)) {
@@ -885,7 +930,33 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
             [environment removeObjectForKey:@"MODELSCOPE_CACHE"];
         }
         task.environment = environment;
-        task.standardError = [NSPipe pipe];
+        NSPipe *progressPipe = [NSPipe pipe];
+        task.standardOutput = progressPipe;
+        task.standardError = NSFileHandle.fileHandleWithNullDevice;
+        __block NSMutableString *progressBuffer = [NSMutableString string];
+        __weak typeof(self) weakSelf = self;
+        progressPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+            NSData *data = handle.availableData;
+            if (data.length == 0) {
+                handle.readabilityHandler = nil;
+                return;
+            }
+            NSString *chunk = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (!chunk) return;
+            @synchronized (progressBuffer) {
+                [progressBuffer appendString:chunk];
+                NSRange newline = [progressBuffer rangeOfString:@"\n"];
+                while (newline.location != NSNotFound) {
+                    NSString *line = [progressBuffer substringToIndex:newline.location];
+                    [progressBuffer deleteCharactersInRange:NSMakeRange(0, NSMaxRange(newline))];
+                    if ([line hasPrefix:@"PROGRESS "]) {
+                        double progress = [[line substringFromIndex:9] doubleValue];
+                        [weakSelf updateProgress:progress forJob:job];
+                    }
+                    newline = [progressBuffer rangeOfString:@"\n"];
+                }
+            }
+        };
         if (job.cancelled) return;
         job.task = task;
         NSError *launchError = nil;
@@ -895,6 +966,7 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
             return;
         }
         [task waitUntilExit];
+        progressPipe.fileHandleForReading.readabilityHandler = nil;
         job.task = nil;
         if (job.cancelled) {
             [NSFileManager.defaultManager removeItemAtURL:job.temporaryOutputURL error:nil];
@@ -958,6 +1030,7 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     }
     job.finalOutputURL = destination;
     job.state = TranscriptionJobStateFinished;
+    job.progress = 100.0;
     job.filenameField.stringValue = destination.lastPathComponent;
     [self updateJobRow:job];
     [self persistJobs];
@@ -1051,6 +1124,43 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     [self updateJobRow:job];
 }
 
+- (NSString *)remainingTimeText:(NSTimeInterval)seconds {
+    NSInteger total = MAX(1, (NSInteger)ceil(seconds));
+    NSInteger hours = total / 3600;
+    NSInteger minutes = (total % 3600) / 60;
+    NSInteger remainingSeconds = total % 60;
+    if ([self isChineseInterface]) {
+        if (hours > 0) return [NSString stringWithFormat:@"%ld小时%ld分钟", (long)hours, (long)minutes];
+        if (minutes > 0) return [NSString stringWithFormat:@"%ld分%ld秒", (long)minutes, (long)remainingSeconds];
+        return [NSString stringWithFormat:@"%ld秒", (long)remainingSeconds];
+    }
+    if (hours > 0) return [NSString stringWithFormat:@"%ldh %ldm", (long)hours, (long)minutes];
+    if (minutes > 0) return [NSString stringWithFormat:@"%ldm %lds", (long)minutes, (long)remainingSeconds];
+    return [NSString stringWithFormat:@"%lds", (long)remainingSeconds];
+}
+
+- (NSString *)processingTextForJob:(TranscriptionJob *)job {
+    BOOL standard = [job.transcriptionMode isEqualToString:TranscriptionModeStandard];
+    NSString *modeName = standard
+        ? [self english:@"Standard" chinese:@"标准转写"]
+        : [self english:@"Fast" chinese:@"快速转写"];
+    NSInteger percent = MAX(0, MIN(99, (NSInteger)llround(job.progress)));
+    if (percent < 8 || !job.progressStartedAt) {
+        return [self english:[NSString stringWithFormat:@"%@ %ld%% · Preparing models…", modeName, (long)percent]
+                         chinese:[NSString stringWithFormat:@"%@ %ld%% · 正在准备模型…", modeName, (long)percent]];
+    }
+    NSTimeInterval elapsed = job.estimationStartedAt ? [NSDate.date timeIntervalSinceDate:job.estimationStartedAt] : 0.0;
+    double completedSinceEstimate = job.progress - job.estimationStartProgress;
+    if (elapsed < 2.0 || completedSinceEstimate < 1.0) {
+        return [self english:[NSString stringWithFormat:@"%@ %ld%% · Calculating remaining time…", modeName, (long)percent]
+                         chinese:[NSString stringWithFormat:@"%@ %ld%% · 正在计算剩余时间…", modeName, (long)percent]];
+    }
+    NSTimeInterval remaining = (100.0 - job.progress) / (completedSinceEstimate / elapsed);
+    NSString *duration = [self remainingTimeText:remaining];
+    return [self english:[NSString stringWithFormat:@"%@ %ld%% · About %@ remaining", modeName, (long)percent, duration]
+                     chinese:[NSString stringWithFormat:@"%@ %ld%% · 预计剩余 %@", modeName, (long)percent, duration]];
+}
+
 - (void)updateJobRow:(TranscriptionJob *)job {
     BOOL audioAvailable = [NSFileManager.defaultManager fileExistsAtPath:job.recordingURL.path];
     BOOL outputAvailable = job.finalOutputURL && [NSFileManager.defaultManager fileExistsAtPath:job.finalOutputURL.path];
@@ -1060,12 +1170,16 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     switch (job.state) {
         case TranscriptionJobStateQueued:
             job.stateLabel.stringValue = [self english:@"Waiting…" chinese:@"等待处理…"];
+            job.stateLabel.textColor = NSColor.secondaryLabelColor;
+            job.progressIndicator.hidden = NO;
             [job.progressIndicator startAnimation:nil];
             job.revealButton.enabled = NO;
             job.filenameField.editable = YES;
             break;
         case TranscriptionJobStateProcessing:
-            job.stateLabel.stringValue = [self english:@"Identifying speakers and transcribing…" chinese:@"正在区分说话人并转写…"];
+            job.stateLabel.stringValue = [self processingTextForJob:job];
+            job.stateLabel.textColor = NSColor.secondaryLabelColor;
+            job.progressIndicator.hidden = NO;
             [job.progressIndicator startAnimation:nil];
             job.revealButton.enabled = NO;
             job.filenameField.editable = YES;
@@ -1135,6 +1249,11 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
     }
     job.state = TranscriptionJobStateQueued;
     job.cancelled = NO;
+    job.transcriptionMode = self.transcriptionMode ?: TranscriptionModeFast;
+    job.progress = 0.0;
+    job.progressStartedAt = nil;
+    job.estimationStartedAt = nil;
+    job.estimationStartProgress = 0.0;
     job.temporaryOutputURL = [self.storageDirectory URLByAppendingPathComponent:[NSString stringWithFormat:@"result-%@.txt", NSUUID.UUID.UUIDString]];
     job.filenameField.editable = YES;
     job.progressIndicator.hidden = NO;
@@ -1221,7 +1340,11 @@ typedef NS_ENUM(NSInteger, TranscriptionJobState) {
 @property(nonatomic, strong) NSMenuItem *interfaceLanguageItem;
 @property(nonatomic, strong) NSMenuItem *englishInterfaceItem;
 @property(nonatomic, strong) NSMenuItem *chineseInterfaceItem;
+@property(nonatomic, strong) NSMenuItem *transcriptionModeItem;
+@property(nonatomic, strong) NSMenuItem *fastTranscriptionItem;
+@property(nonatomic, strong) NSMenuItem *standardTranscriptionItem;
 @property(nonatomic, copy) NSString *interfaceLanguage;
+@property(nonatomic, copy) NSString *transcriptionMode;
 @property(nonatomic, strong) id shortcutMonitor;
 @property(nonatomic) EventHotKeyRef recordingHotKey;
 @property(nonatomic) EventHandlerRef hotKeyEventHandler;
@@ -1251,16 +1374,19 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     [UNUserNotificationCenter.currentNotificationCenter requestAuthorizationWithOptions:UNAuthorizationOptionAlert | UNAuthorizationOptionSound completionHandler:^(BOOL granted, NSError *error) {}];
     [NSUserDefaults.standardUserDefaults registerDefaults:@{
         @"SnackRecordInterfaceLanguage": @"zh",
+        @"SnackRecordTranscriptionMode": TranscriptionModeFast,
     }];
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"SnackRecordChineseDefaultsApplied"]) {
         [NSUserDefaults.standardUserDefaults setObject:@"zh" forKey:@"SnackRecordInterfaceLanguage"];
         [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"SnackRecordChineseDefaultsApplied"];
     }
     self.interfaceLanguage = [NSUserDefaults.standardUserDefaults stringForKey:@"SnackRecordInterfaceLanguage"] ?: @"en";
+    self.transcriptionMode = [NSUserDefaults.standardUserDefaults stringForKey:@"SnackRecordTranscriptionMode"] ?: TranscriptionModeFast;
     NSImage *applicationIcon = RoundedApplicationIcon();
     if (applicationIcon) NSApp.applicationIconImage = applicationIcon;
     self.controller = [[TranscriptionController alloc] init];
     [self.controller applyInterfaceLanguage:self.interfaceLanguage];
+    [self.controller applyTranscriptionMode:self.transcriptionMode];
     self.controller.window.miniwindowImage = applicationIcon;
     self.controller.window.miniwindowTitle = @"Snack Record";
     [self configureStatusItem];
@@ -1324,12 +1450,18 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     BOOL chinese = [self isChineseInterface];
     self.startRecordingItem.title = chinese ? @"开始录音" : @"Start recording";
     self.stopRecordingItem.title = chinese ? @"停止录音" : @"Stop recording";
+    self.transcriptionModeItem.title = chinese ? @"转写模式" : @"Transcription mode";
+    self.fastTranscriptionItem.title = chinese ? @"快速转写（不区分说话人）" : @"Fast transcription (no speakers)";
+    self.standardTranscriptionItem.title = chinese ? @"标准转写（区分说话人）" : @"Standard transcription (speakers)";
     self.interfaceLanguageItem.title = chinese ? @"系统语言" : @"Language";
     self.showWindowItem.title = chinese ? @"显示窗口" : @"Show window";
     self.quitItem.title = chinese ? @"退出 Snack Record" : @"Quit Snack Record";
     self.mainQuitItem.title = chinese ? @"退出 Snack Record" : @"Quit Snack Record";
     self.englishInterfaceItem.state = chinese ? NSControlStateValueOff : NSControlStateValueOn;
     self.chineseInterfaceItem.state = chinese ? NSControlStateValueOn : NSControlStateValueOff;
+    BOOL standard = [self.transcriptionMode isEqualToString:TranscriptionModeStandard];
+    self.fastTranscriptionItem.state = standard ? NSControlStateValueOff : NSControlStateValueOn;
+    self.standardTranscriptionItem.state = standard ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
 - (void)changeInterfaceLanguage:(NSString *)language {
@@ -1341,6 +1473,18 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
 
 - (void)selectEnglishInterface:(id)sender { [self changeInterfaceLanguage:@"en"]; }
 - (void)selectChineseInterface:(id)sender { [self changeInterfaceLanguage:@"zh"]; }
+
+- (void)changeTranscriptionMode:(NSString *)mode {
+    self.transcriptionMode = [mode isEqualToString:TranscriptionModeStandard]
+        ? TranscriptionModeStandard
+        : TranscriptionModeFast;
+    [NSUserDefaults.standardUserDefaults setObject:self.transcriptionMode forKey:@"SnackRecordTranscriptionMode"];
+    [self.controller applyTranscriptionMode:self.transcriptionMode];
+    [self updateLanguageMenus];
+}
+
+- (void)selectFastTranscription:(id)sender { [self changeTranscriptionMode:TranscriptionModeFast]; }
+- (void)selectStandardTranscription:(id)sender { [self changeTranscriptionMode:TranscriptionModeStandard]; }
 
 - (void)configureStatusItem {
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
@@ -1358,6 +1502,17 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     self.stopRecordingItem.target = self;
     [menu addItem:self.stopRecordingItem];
     [menu addItem:NSMenuItem.separatorItem];
+
+    self.transcriptionModeItem = [[NSMenuItem alloc] initWithTitle:@"Transcription mode" action:nil keyEquivalent:@""];
+    NSMenu *transcriptionModeMenu = [[NSMenu alloc] initWithTitle:@"Transcription mode"];
+    self.fastTranscriptionItem = [[NSMenuItem alloc] initWithTitle:@"Fast transcription (no speakers)" action:@selector(selectFastTranscription:) keyEquivalent:@""];
+    self.fastTranscriptionItem.target = self;
+    [transcriptionModeMenu addItem:self.fastTranscriptionItem];
+    self.standardTranscriptionItem = [[NSMenuItem alloc] initWithTitle:@"Standard transcription (speakers)" action:@selector(selectStandardTranscription:) keyEquivalent:@""];
+    self.standardTranscriptionItem.target = self;
+    [transcriptionModeMenu addItem:self.standardTranscriptionItem];
+    self.transcriptionModeItem.submenu = transcriptionModeMenu;
+    [menu addItem:self.transcriptionModeItem];
 
     self.interfaceLanguageItem = [[NSMenuItem alloc] initWithTitle:@"Language" action:nil keyEquivalent:@""];
     NSMenu *interfaceMenu = [[NSMenu alloc] initWithTitle:@"Language"];
