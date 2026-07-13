@@ -4,7 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT/build"
 APP="$BUILD_DIR/Snack Record.app"
-SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+if [[ -z "${SIGN_IDENTITY:-}" ]]; then
+  if security find-identity -v -p codesigning 2>/dev/null | /usr/bin/grep -Fq '"Snack Record Local Code Signing"'; then
+    SIGN_IDENTITY="Snack Record Local Code Signing"
+  else
+    SIGN_IDENTITY="-"
+  fi
+fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
