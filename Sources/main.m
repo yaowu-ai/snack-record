@@ -187,6 +187,10 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, strong) NSURL *recordingsDirectory;
 @property(nonatomic, strong) NSURL *jobsMetadataURL;
 @property(nonatomic) dispatch_queue_t transcriptionQueue;
+@property(nonatomic, strong) NSTask *modelWorkerTask;
+@property(nonatomic, strong) NSFileHandle *modelWorkerInput;
+@property(nonatomic, strong) NSFileHandle *modelWorkerOutput;
+@property(nonatomic, strong) NSMutableData *modelWorkerReadBuffer;
 @property(nonatomic) TranscriptionState currentState;
 @property(nonatomic, copy) NSString *transcriptionMode;
 @property(nonatomic) BOOL waitingForMicrophonePermission;
@@ -199,6 +203,8 @@ static NSString *const TranscriptionModeStandard = @"standard";
 - (void)cancelTranscriptions;
 - (void)applyInterfaceLanguage:(NSString *)language;
 - (void)applyTranscriptionMode:(NSString *)mode;
+- (void)preloadModels;
+- (void)shutdownWorker;
 @end
 
 @implementation TranscriptionController
@@ -217,6 +223,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
         [self configureWindow];
         [self configureRecordingPanel];
         [self renderState:TranscriptionStateReady message:nil];
+        [self preloadModels];
     }
     return self;
 }
@@ -886,6 +893,96 @@ static NSString *const TranscriptionModeStandard = @"standard";
     });
 }
 
+- (NSMutableDictionary<NSString *, NSString *> *)workerEnvironment {
+    NSMutableDictionary<NSString *, NSString *> *environment = [NSProcessInfo.processInfo.environment mutableCopy];
+    NSString *modelCache = [[SnackRecordApplicationSupportURL() URLByAppendingPathComponent:@"Models"] path];
+    if (HasCompleteModelCacheAtPath(modelCache)) {
+        environment[@"MODELSCOPE_CACHE"] = modelCache;
+    } else {
+        [environment removeObjectForKey:@"MODELSCOPE_CACHE"];
+    }
+    environment[@"PYTHONUNBUFFERED"] = @"1";
+    return environment;
+}
+
+- (void)clearWorkerReferences {
+    self.modelWorkerTask = nil;
+    self.modelWorkerInput = nil;
+    self.modelWorkerOutput = nil;
+    self.modelWorkerReadBuffer = nil;
+}
+
+- (NSString *)readWorkerLine {
+    if (!self.modelWorkerOutput) return nil;
+    if (!self.modelWorkerReadBuffer) self.modelWorkerReadBuffer = [NSMutableData data];
+    NSData *newlineData = [@"\n" dataUsingEncoding:NSUTF8StringEncoding];
+    while (YES) {
+        NSRange searchRange = NSMakeRange(0, self.modelWorkerReadBuffer.length);
+        NSRange newline = [self.modelWorkerReadBuffer rangeOfData:newlineData options:0 range:searchRange];
+        if (newline.location != NSNotFound) {
+            NSData *lineData = [self.modelWorkerReadBuffer subdataWithRange:NSMakeRange(0, newline.location)];
+            [self.modelWorkerReadBuffer replaceBytesInRange:NSMakeRange(0, NSMaxRange(newline)) withBytes:NULL length:0];
+            return [[NSString alloc] initWithData:lineData encoding:NSUTF8StringEncoding];
+        }
+        NSData *chunk = [self.modelWorkerOutput readDataOfLength:4096];
+        if (chunk.length == 0) return nil;
+        [self.modelWorkerReadBuffer appendData:chunk];
+    }
+}
+
+- (NSDictionary *)readWorkerEvent {
+    while (self.modelWorkerTask.isRunning || self.modelWorkerReadBuffer.length > 0) {
+        NSString *line = [self readWorkerLine];
+        if (!line) return nil;
+        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *event = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if ([event isKindOfClass:NSDictionary.class]) return event;
+    }
+    return nil;
+}
+
+- (BOOL)startWorkerIfNeeded {
+    if (self.modelWorkerTask.isRunning && self.modelWorkerInput && self.modelWorkerOutput) return YES;
+    [self clearWorkerReferences];
+
+    NSString *pythonExecutable = PythonExecutablePath();
+    NSString *script = [NSBundle.mainBundle pathForResource:@"funasr_transcribe" ofType:@"py"];
+    if (![NSFileManager.defaultManager isExecutableFileAtPath:pythonExecutable] || !script) return NO;
+
+    NSTask *task = [[NSTask alloc] init];
+    NSPipe *inputPipe = [NSPipe pipe];
+    NSPipe *outputPipe = [NSPipe pipe];
+    task.executableURL = [NSURL fileURLWithPath:pythonExecutable];
+    task.arguments = @[script, @"--worker"];
+    task.environment = [self workerEnvironment];
+    task.standardInput = inputPipe;
+    task.standardOutput = outputPipe;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    NSError *launchError = nil;
+    if (![task launchAndReturnError:&launchError]) return NO;
+
+    self.modelWorkerTask = task;
+    self.modelWorkerInput = inputPipe.fileHandleForWriting;
+    self.modelWorkerOutput = outputPipe.fileHandleForReading;
+    self.modelWorkerReadBuffer = [NSMutableData data];
+    while (task.isRunning) {
+        NSDictionary *event = [self readWorkerEvent];
+        if (!event) break;
+        if ([event[@"type"] isEqualToString:@"ready"]) return YES;
+    }
+    if (task.isRunning) [task terminate];
+    [self clearWorkerReferences];
+    return NO;
+}
+
+- (void)preloadModels {
+    dispatch_async(self.transcriptionQueue, ^{ [self startWorkerIfNeeded]; });
+}
+
+- (void)shutdownWorker {
+    if (self.modelWorkerTask.isRunning) [self.modelWorkerTask terminate];
+}
+
 - (void)transcribeJob:(TranscriptionJob *)job {
     dispatch_async(self.transcriptionQueue, ^{
         if (job.cancelled) return;
@@ -900,79 +997,64 @@ static NSString *const TranscriptionModeStandard = @"standard";
             [self persistJobs];
         });
 
-        NSString *pythonExecutable = PythonExecutablePath();
-        if (![NSFileManager.defaultManager isExecutableFileAtPath:pythonExecutable]) {
+        if (![NSFileManager.defaultManager isExecutableFileAtPath:PythonExecutablePath()]) {
             [self failJob:job message:[self english:@"Local FunASR environment not found" chinese:@"未找到本地环境"]];
             return;
         }
-        NSString *script = [NSBundle.mainBundle pathForResource:@"funasr_transcribe" ofType:@"py"];
-        if (!script) {
-            [self failJob:job message:[self english:@"Transcription script not found" chinese:@"未找到转写脚本"]];
+        if (![self startWorkerIfNeeded]) {
+            [self failJob:job message:[self english:@"Unable to start the local model worker" chinese:@"无法启动本地模型服务"]];
             return;
         }
 
         NSDateFormatter *startFormatter = [[NSDateFormatter alloc] init];
         startFormatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"zh_CN"];
         startFormatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-
-        NSTask *task = [[NSTask alloc] init];
-        task.executableURL = [NSURL fileURLWithPath:pythonExecutable];
         NSString *mode = [job.transcriptionMode isEqualToString:TranscriptionModeStandard]
             ? TranscriptionModeStandard
             : TranscriptionModeFast;
-        task.arguments = @[script, job.recordingURL.path, job.temporaryOutputURL.path,
-                           [startFormatter stringFromDate:job.startDate], @"--mode", mode];
-        NSMutableDictionary<NSString *, NSString *> *environment = [NSProcessInfo.processInfo.environment mutableCopy];
-        NSString *modelCache = [[SnackRecordApplicationSupportURL() URLByAppendingPathComponent:@"Models"] path];
-        if (HasCompleteModelCacheAtPath(modelCache)) {
-            environment[@"MODELSCOPE_CACHE"] = modelCache;
-        } else {
-            [environment removeObjectForKey:@"MODELSCOPE_CACHE"];
-        }
-        task.environment = environment;
-        NSPipe *progressPipe = [NSPipe pipe];
-        task.standardOutput = progressPipe;
-        task.standardError = NSFileHandle.fileHandleWithNullDevice;
-        __block NSMutableString *progressBuffer = [NSMutableString string];
-        __weak typeof(self) weakSelf = self;
-        progressPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
-            NSData *data = handle.availableData;
-            if (data.length == 0) {
-                handle.readabilityHandler = nil;
-                return;
-            }
-            NSString *chunk = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (!chunk) return;
-            @synchronized (progressBuffer) {
-                [progressBuffer appendString:chunk];
-                NSRange newline = [progressBuffer rangeOfString:@"\n"];
-                while (newline.location != NSNotFound) {
-                    NSString *line = [progressBuffer substringToIndex:newline.location];
-                    [progressBuffer deleteCharactersInRange:NSMakeRange(0, NSMaxRange(newline))];
-                    if ([line hasPrefix:@"PROGRESS "]) {
-                        double progress = [[line substringFromIndex:9] doubleValue];
-                        [weakSelf updateProgress:progress forJob:job];
-                    }
-                    newline = [progressBuffer rangeOfString:@"\n"];
-                }
-            }
+        NSDictionary *request = @{
+            @"id": job.identifier,
+            @"input": job.recordingURL.path,
+            @"output": job.temporaryOutputURL.path,
+            @"start_time": [startFormatter stringFromDate:job.startDate],
+            @"mode": mode,
         };
-        if (job.cancelled) return;
-        job.task = task;
-        NSError *launchError = nil;
-        if (![task launchAndReturnError:&launchError]) {
-            job.task = nil;
-            [self failJob:job message:[self english:@"Unable to start FunASR" chinese:@"无法启动 FunASR"]];
+        NSMutableData *requestData = [[NSJSONSerialization dataWithJSONObject:request options:0 error:nil] mutableCopy];
+        [requestData appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+        @try {
+            [self.modelWorkerInput writeData:requestData];
+        } @catch (NSException *exception) {
+            [self shutdownWorker];
+            [self clearWorkerReferences];
+            [self failJob:job message:[self english:@"The local model worker stopped" chinese:@"本地模型服务已停止"]];
             return;
         }
-        [task waitUntilExit];
-        progressPipe.fileHandleForReading.readabilityHandler = nil;
+
+        job.task = self.modelWorkerTask;
+        BOOL completed = NO;
+        BOOL failed = NO;
+        while (self.modelWorkerTask.isRunning && !job.cancelled) {
+            NSDictionary *event = [self readWorkerEvent];
+            if (!event) break;
+            if (![event[@"id"] isEqualToString:job.identifier]) continue;
+            NSString *type = event[@"type"];
+            if ([type isEqualToString:@"progress"]) {
+                [self updateProgress:[event[@"percent"] doubleValue] forJob:job];
+            } else if ([type isEqualToString:@"completed"]) {
+                completed = YES;
+                break;
+            } else if ([type isEqualToString:@"error"]) {
+                failed = YES;
+                break;
+            }
+        }
         job.task = nil;
         if (job.cancelled) {
             [NSFileManager.defaultManager removeItemAtURL:job.temporaryOutputURL error:nil];
             return;
         }
-        if (task.terminationStatus != 0 || ![NSFileManager.defaultManager fileExistsAtPath:job.temporaryOutputURL.path]) {
+        if (!completed || failed || ![NSFileManager.defaultManager fileExistsAtPath:job.temporaryOutputURL.path]) {
+            if (!self.modelWorkerTask.isRunning) [self clearWorkerReferences];
             [self failJob:job message:[self english:@"Transcription failed" chinese:@"转写失败"]];
             return;
         }
@@ -1585,6 +1667,7 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     if (self.shortcutMonitor) [NSEvent removeMonitor:self.shortcutMonitor];
     if (self.recordingHotKey) UnregisterEventHotKey(self.recordingHotKey);
     if (self.hotKeyEventHandler) RemoveEventHandler(self.hotKeyEventHandler);
+    [self.controller shutdownWorker];
 }
 
 @end

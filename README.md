@@ -11,6 +11,7 @@ Local macOS meeting recorder and Chinese transcription app powered by FunASR.
 - Keeps the seven most recent tasks and cached audio locally.
 - Offers fast transcription without speaker labels and standard transcription with speaker diarization.
 - Shows transcription percentage and estimated remaining time for long audio.
+- Preloads the local models once at app launch and reuses them across transcription tasks.
 - Supports Chinese and English UI.
 
 ## AI coding tool installation

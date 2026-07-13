@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +44,8 @@ def relative_time(milliseconds: int) -> str:
 
 
 class ProgressReporter:
-    def __init__(self) -> None:
+    def __init__(self, request_id: str | None = None) -> None:
+        self.request_id = request_id
         self.last_percent = -1.0
 
     def emit(self, percent: float) -> None:
@@ -50,7 +53,16 @@ class ProgressReporter:
         if percent < 100.0 and percent - self.last_percent < 0.5:
             return
         self.last_percent = percent
-        print(f"PROGRESS {percent:.1f}", flush=True)
+        if self.request_id is None:
+            print(f"PROGRESS {percent:.1f}", flush=True)
+        else:
+            print(
+                json.dumps(
+                    {"type": "progress", "id": self.request_id, "percent": round(percent, 1)},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
 
 
 def audio_duration_ms(value: object) -> float:
@@ -67,7 +79,7 @@ def audio_duration_ms(value: object) -> float:
     return float(sample_count * batch_count) / 16.0
 
 
-def install_progress_bridge(model: AutoModel, reporter: ProgressReporter, mode: str) -> None:
+def install_progress_bridge(model: AutoModel, reporter: ProgressReporter, mode: str):
     original_inference = model.inference
     state = {
         "total_speech_ms": 0.0,
@@ -111,50 +123,59 @@ def install_progress_bridge(model: AutoModel, reporter: ProgressReporter, mode: 
         return result
 
     model.inference = inference_with_progress
+    return original_inference
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Transcribe a WAV file with local paraformer-zh.")
-    parser.add_argument("input", type=Path)
-    parser.add_argument("output", type=Path)
-    parser.add_argument("start_time")
-    parser.add_argument("--mode", choices=("fast", "standard"), default="fast")
-    args = parser.parse_args()
-    reporter = ProgressReporter()
-    reporter.emit(1.0)
-
-    model, vad_model, punc_model, speaker_model = local_model_directories()
-
+def create_model(include_speaker: bool) -> AutoModel:
+    model_path, vad_model, punc_model, speaker_model = local_model_directories()
     model_options = dict(
-        model=str(model),
+        model=str(model_path),
         vad_model=str(vad_model),
         punc_model=str(punc_model),
         disable_update=True,
         disable_pbar=True,
     )
-    if args.mode == "standard":
+    if include_speaker:
         model_options["spk_model"] = str(speaker_model)
-    model = AutoModel(**model_options)
+    return AutoModel(**model_options)
+
+
+def transcribe(
+    model: AutoModel,
+    input_path: Path,
+    output_path: Path,
+    start_time: str,
+    mode: str,
+    reporter: ProgressReporter,
+) -> None:
     reporter.emit(5.0)
-    install_progress_bridge(model, reporter, args.mode)
-    results = model.generate(
-        input=str(args.input),
-        batch_size_s=300,
-        sentence_timestamp=args.mode == "fast",
-    )
+    speaker_model = model.spk_model
+    if mode == "fast":
+        model.spk_model = None
+    original_inference = install_progress_bridge(model, reporter, mode)
+    try:
+        results = model.generate(
+            input=str(input_path),
+            batch_size_s=300,
+            sentence_timestamp=mode == "fast",
+        )
+    finally:
+        model.inference = original_inference
+        model.spk_model = speaker_model
+
     if not results:
         raise RuntimeError("FunASR returned no transcribed text")
     reporter.emit(98.0)
 
     sentences = results[0].get("sentence_info") or []
-    lines = [f"录音开始时间：{args.start_time}", ""]
+    lines = [f"录音开始时间：{start_time}", ""]
     if sentences:
         for sentence in sentences:
             text = normalize_text(sentence.get("text") or sentence.get("sentence") or "")
             if not text:
                 continue
             timestamp = relative_time(sentence.get("start", 0))
-            if args.mode == "standard":
+            if mode == "standard":
                 speaker = int(sentence.get("spk", 0)) + 1
                 lines.append(f"[{timestamp}] 说话人 {speaker}：{text}")
             else:
@@ -162,15 +183,62 @@ def main() -> None:
     else:
         text = normalize_text(results[0].get("text", ""))
         if text:
-            prefix = "说话人 1：" if args.mode == "standard" else ""
+            prefix = "说话人 1：" if mode == "standard" else ""
             lines.append(f"[00:00:00] {prefix}{text}")
 
     if len(lines) == 2:
         raise RuntimeError("FunASR returned no transcribed text")
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     reporter.emit(100.0)
+
+
+def run_worker() -> None:
+    model = create_model(include_speaker=True)
+    print(json.dumps({"type": "ready"}), flush=True)
+    for line in sys.stdin:
+        request = {}
+        try:
+            request = json.loads(line)
+            request_id = str(request["id"])
+            mode = "standard" if request.get("mode") == "standard" else "fast"
+            reporter = ProgressReporter(request_id)
+            transcribe(
+                model=model,
+                input_path=Path(request["input"]),
+                output_path=Path(request["output"]),
+                start_time=str(request["start_time"]),
+                mode=mode,
+                reporter=reporter,
+            )
+            print(json.dumps({"type": "completed", "id": request_id}), flush=True)
+        except Exception as error:
+            request_id = str(request.get("id", ""))
+            print(
+                json.dumps({"type": "error", "id": request_id, "message": str(error)}, ensure_ascii=False),
+                flush=True,
+            )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Transcribe a WAV file with local paraformer-zh.")
+    parser.add_argument("input", type=Path, nargs="?")
+    parser.add_argument("output", type=Path, nargs="?")
+    parser.add_argument("start_time", nargs="?")
+    parser.add_argument("--mode", choices=("fast", "standard"), default="fast")
+    parser.add_argument("--worker", action="store_true")
+    args = parser.parse_args()
+    if args.worker:
+        run_worker()
+        return
+    if not args.input or not args.output or not args.start_time:
+        parser.error("input, output, and start_time are required unless --worker is used")
+
+    reporter = ProgressReporter()
+    reporter.emit(1.0)
+    model = create_model(include_speaker=args.mode == "standard")
+    transcribe(model, args.input, args.output, args.start_time, args.mode, reporter)
 
 
 if __name__ == "__main__":
