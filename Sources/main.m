@@ -382,21 +382,24 @@ static NSString *const TranscriptionModeStandard = @"standard";
     [view addSubview:self.statusLabel];
 
     self.recordButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"mic.fill" accessibilityDescription:@"Start recording"] target:self action:@selector(toggleRecording:)];
-    self.recordButton.bezelStyle = NSBezelStyleCircular;
+    self.recordButton.bordered = NO;
     self.recordButton.imagePosition = NSImageOnly;
     self.recordButton.toolTip = @"Start meeting recording (Control+R)";
-    self.recordButton.bezelColor = BrandOrange();
     self.recordButton.contentTintColor = NSColor.whiteColor;
     self.recordButton.frame = NSMakeRect(426, 434, 52, 52);
+    self.recordButton.wantsLayer = YES;
+    self.recordButton.layer.backgroundColor = BrandOrange().CGColor;
+    self.recordButton.layer.cornerRadius = 26;
+    self.recordButton.layer.masksToBounds = YES;
     self.recordButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [view addSubview:self.recordButton];
 
     self.settingsButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"gearshape" accessibilityDescription:@"Settings"] target:self action:@selector(showSettings:)];
-    self.settingsButton.bezelStyle = NSBezelStyleTexturedRounded;
+    self.settingsButton.bezelStyle = NSBezelStyleCircular;
     self.settingsButton.imagePosition = NSImageOnly;
-    self.settingsButton.contentTintColor = [NSColor colorWithSRGBRed:0.22 green:0.19 blue:0.16 alpha:0.78];
+    self.settingsButton.contentTintColor = BrandOrange();
     self.settingsButton.toolTip = @"Settings";
-    self.settingsButton.frame = NSMakeRect(382, 443, 34, 34);
+    self.settingsButton.frame = NSMakeRect(374, 439, 42, 42);
     self.settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [view addSubview:self.settingsButton];
 
@@ -1423,25 +1426,20 @@ static NSString *const TranscriptionModeStandard = @"standard";
     NSString *symbol = @"mic.fill";
     NSString *status = message ?: [self english:@"Click record or press Control+R to start" chinese:@"点击录音或按 Control+R 开始"];
     NSString *tooltip = [self english:@"Start meeting recording (Control+R)" chinese:@"开始会议录音（Control+R）"];
-    NSColor *color = BrandOrange();
-
     switch (state) {
         case TranscriptionStateRecording:
             symbol = @"stop.fill";
             status = [self english:@"Recording system audio and microphone" chinese:@"正在录制系统音频与麦克风"];
             tooltip = [self english:@"Stop and transcribe" chinese:@"停止录音并转写"];
-            color = NSColor.systemRedColor;
             self.recordingTitleLabel.stringValue = [self english:@"Recording meeting" chinese:@"正在录制会议"];
             break;
         case TranscriptionStateFinished:
             symbol = @"mic.fill";
             status = message ?: [self english:@"Transcript saved to Desktop" chinese:@"转写已保存到桌面"];
-            color = NSColor.systemGreenColor;
             break;
         case TranscriptionStateFailed:
             symbol = @"exclamationmark.triangle";
             status = message ?: [self english:@"Something went wrong. Please try again." chinese:@"出现错误，请重试"];
-            color = NSColor.systemOrangeColor;
             break;
         case TranscriptionStateReady:
             break;
@@ -1450,7 +1448,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     self.statusLabel.stringValue = status;
     self.recordButton.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:tooltip];
     self.recordButton.toolTip = tooltip;
-    self.recordButton.bezelColor = state == TranscriptionStateRecording ? NSColor.systemRedColor : BrandOrange();
+    self.recordButton.layer.backgroundColor = (state == TranscriptionStateRecording ? NSColor.systemRedColor : BrandOrange()).CGColor;
     self.recordButton.contentTintColor = NSColor.whiteColor;
     self.recordButton.enabled = YES;
     if (state == TranscriptionStateRecording) [self showRecordingCard]; else [self hideRecordingCard];
