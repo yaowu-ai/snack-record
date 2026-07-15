@@ -22,6 +22,7 @@ cp "$ROOT/Assets/SnackLogo.png" "$APP/Contents/Resources/SnackLogo.png"
 clang -fobjc-arc "$ROOT/Sources/main.m" \
   -framework Cocoa \
   -framework AVFoundation \
+  -framework AudioToolbox \
   -framework Carbon \
   -framework ScreenCaptureKit \
   -framework CoreMedia \

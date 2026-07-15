@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <Carbon/Carbon.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -1442,6 +1443,386 @@ static NSString *const TranscriptionModeStandard = @"standard";
 
 @end
 
+@interface MeetingReminderMonitor : NSObject <SCStreamOutput, SCStreamDelegate>
+@property(nonatomic) BOOL enabled;
+@property(nonatomic) BOOL recordingActive;
+@property(nonatomic) BOOL probeStarting;
+@property(nonatomic) double activeAudioSeconds;
+@property(nonatomic, copy) NSString *interfaceLanguage;
+@property(nonatomic, copy) NSString *probeBundleIdentifier;
+@property(nonatomic, copy) NSString *detectedApplicationName;
+@property(nonatomic, strong) NSDate *cooldownUntil;
+@property(nonatomic, strong) NSTimer *pollTimer;
+@property(nonatomic, strong) NSTimer *dismissTimer;
+@property(nonatomic, strong) SCStream *probeStream;
+@property(nonatomic) dispatch_queue_t audioQueue;
+@property(nonatomic, strong) NSPanel *reminderPanel;
+@property(nonatomic, strong) NSTextField *reminderTitleLabel;
+@property(nonatomic, strong) NSTextField *reminderBodyLabel;
+@property(nonatomic, strong) NSButton *startButton;
+@property(nonatomic, copy) void (^startRecordingHandler)(void);
+- (void)setMonitoringEnabled:(BOOL)enabled;
+- (void)setRecordingActive:(BOOL)recordingActive;
+- (void)applyInterfaceLanguage:(NSString *)language;
+- (void)stop;
+@end
+
+@implementation MeetingReminderMonitor
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _interfaceLanguage = @"zh";
+        _audioQueue = dispatch_queue_create("local.snack-record.meeting-reminder-audio", DISPATCH_QUEUE_SERIAL);
+        [self configureReminderPanel];
+    }
+    return self;
+}
+
+- (NSDictionary<NSString *, NSString *> *)monitoredApplications {
+    return @{
+        @"com.tencent.WeWorkMac": @"企业微信",
+        @"com.electron.lark": @"飞书",
+        @"com.bytedance.ee.lark": @"飞书",
+        @"com.tencent.meeting": @"腾讯会议",
+        @"com.tencent.wemeet": @"腾讯会议",
+        @"us.zoom.xos": @"Zoom",
+    };
+}
+
+- (BOOL)isChineseInterface {
+    return [self.interfaceLanguage isEqualToString:@"zh"];
+}
+
+- (void)configureReminderPanel {
+    self.reminderPanel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 326, 116)
+                                                    styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                                                      backing:NSBackingStoreBuffered
+                                                        defer:NO];
+    self.reminderPanel.opaque = NO;
+    self.reminderPanel.backgroundColor = NSColor.clearColor;
+    self.reminderPanel.hasShadow = YES;
+    self.reminderPanel.level = NSStatusWindowLevel;
+    self.reminderPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+    self.reminderPanel.becomesKeyOnlyIfNeeded = YES;
+
+    NSVisualEffectView *card = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, 326, 116)];
+    card.material = NSVisualEffectMaterialHUDWindow;
+    card.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    card.state = NSVisualEffectStateActive;
+    card.wantsLayer = YES;
+    card.layer.cornerRadius = 10;
+    card.layer.masksToBounds = YES;
+    self.reminderPanel.contentView = card;
+
+    NSImageView *icon = [[NSImageView alloc] initWithFrame:NSMakeRect(18, 73, 24, 24)];
+    icon.image = [NSImage imageWithSystemSymbolName:@"video.fill" accessibilityDescription:@"会议录音提醒"];
+    icon.contentTintColor = BrandOrange();
+    [card addSubview:icon];
+
+    self.reminderTitleLabel = [NSTextField labelWithString:@""];
+    self.reminderTitleLabel.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    self.reminderTitleLabel.frame = NSMakeRect(52, 78, 224, 20);
+    [card addSubview:self.reminderTitleLabel];
+
+    self.reminderBodyLabel = [NSTextField wrappingLabelWithString:@""];
+    self.reminderBodyLabel.font = [NSFont systemFontOfSize:11];
+    self.reminderBodyLabel.textColor = NSColor.secondaryLabelColor;
+    self.reminderBodyLabel.frame = NSMakeRect(52, 43, 250, 34);
+    [card addSubview:self.reminderBodyLabel];
+
+    self.startButton = [NSButton buttonWithTitle:@"" target:self action:@selector(startRecordingFromReminder:)];
+    self.startButton.bezelStyle = NSBezelStyleRounded;
+    self.startButton.bezelColor = BrandOrange();
+    self.startButton.contentTintColor = NSColor.whiteColor;
+    self.startButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    self.startButton.frame = NSMakeRect(196, 10, 110, 28);
+    [card addSubview:self.startButton];
+
+    NSButton *dismissButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"xmark" accessibilityDescription:@"关闭提醒"] target:self action:@selector(dismissReminder:)];
+    dismissButton.bezelStyle = NSBezelStyleInline;
+    dismissButton.imagePosition = NSImageOnly;
+    dismissButton.contentTintColor = NSColor.secondaryLabelColor;
+    dismissButton.frame = NSMakeRect(287, 80, 24, 24);
+    [card addSubview:dismissButton];
+    [self updateReminderPanelText];
+}
+
+- (void)updateReminderPanelText {
+    BOOL chinese = [self isChineseInterface];
+    self.reminderTitleLabel.stringValue = chinese ? @"会议录音提醒" : @"Meeting recording reminder";
+    NSString *applicationName = self.detectedApplicationName ?: (chinese ? @"会议应用" : @"meeting app");
+    self.reminderBodyLabel.stringValue = chinese
+        ? [NSString stringWithFormat:@"检测到 %@ 可能正在进行会议，是否开始录音？", applicationName]
+        : [NSString stringWithFormat:@"Audio activity suggests a meeting in %@. Start recording?", applicationName];
+    self.startButton.title = chinese ? @"开始录音" : @"Start recording";
+}
+
+- (void)applyInterfaceLanguage:(NSString *)language {
+    self.interfaceLanguage = [language isEqualToString:@"zh"] ? @"zh" : @"en";
+    [self updateReminderPanelText];
+}
+
+- (void)setMonitoringEnabled:(BOOL)enabled {
+    _enabled = enabled;
+    [self.pollTimer invalidate];
+    self.pollTimer = nil;
+    if (!enabled) {
+        [self stopProbe];
+        [self hideReminder];
+        return;
+    }
+    self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:8.0 target:self selector:@selector(pollForMeeting:) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.pollTimer forMode:NSRunLoopCommonModes];
+    [self pollForMeeting:nil];
+}
+
+- (void)setRecordingActive:(BOOL)recordingActive {
+    _recordingActive = recordingActive;
+    if (recordingActive) {
+        [self stopProbe];
+        [self hideReminder];
+    } else if (self.enabled) {
+        [self pollForMeeting:nil];
+    }
+}
+
+- (void)stop {
+    [self.pollTimer invalidate];
+    self.pollTimer = nil;
+    [self stopProbe];
+    [self hideReminder];
+}
+
+- (void)pollForMeeting:(NSTimer *)timer {
+    if (!self.enabled || self.recordingActive || self.reminderPanel.isVisible) return;
+    if (self.cooldownUntil && [self.cooldownUntil timeIntervalSinceNow] > 0) return;
+
+    NSDictionary<NSString *, NSString *> *applications = [self monitoredApplications];
+    NSMutableSet<NSString *> *runningBundleIdentifiers = [NSMutableSet set];
+    for (NSRunningApplication *application in NSWorkspace.sharedWorkspace.runningApplications) {
+        if (applications[application.bundleIdentifier]) [runningBundleIdentifiers addObject:application.bundleIdentifier];
+    }
+    if (runningBundleIdentifiers.count == 0) {
+        [self stopProbe];
+        return;
+    }
+    if (self.probeStarting) return;
+
+    self.probeStarting = YES;
+    __weak typeof(self) weakSelf = self;
+    [SCShareableContent getShareableContentExcludingDesktopWindows:YES
+                                               onScreenWindowsOnly:YES
+                                                 completionHandler:^(SCShareableContent *content, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.probeStarting = NO;
+            if (!strongSelf.enabled || strongSelf.recordingActive || error || content.displays.count == 0) return;
+            if (strongSelf.probeStream) {
+                BOOL meetingWindowStillVisible = NO;
+                for (SCWindow *window in content.windows) {
+                    NSString *bundleIdentifier = window.owningApplication.bundleIdentifier;
+                    if ([bundleIdentifier isEqualToString:strongSelf.probeBundleIdentifier] &&
+                        [strongSelf windowSuggestsMeeting:window bundleIdentifier:bundleIdentifier]) {
+                        meetingWindowStillVisible = YES;
+                        break;
+                    }
+                }
+                if (meetingWindowStillVisible) return;
+                [strongSelf stopProbe];
+            }
+            [strongSelf startProbeForContent:content runningBundleIdentifiers:runningBundleIdentifiers];
+        });
+    }];
+}
+
+- (BOOL)windowSuggestsMeeting:(SCWindow *)window bundleIdentifier:(NSString *)bundleIdentifier {
+    NSString *title = window.title.lowercaseString ?: @"";
+    NSArray<NSString *> *keywords = @[@"会议", @"通话", @"视频", @"meeting", @"call", @"zoom"];
+    for (NSString *keyword in keywords) {
+        if ([title containsString:keyword]) return YES;
+    }
+    BOOL dedicatedMeetingApplication = [bundleIdentifier isEqualToString:@"us.zoom.xos"] ||
+        [bundleIdentifier isEqualToString:@"com.tencent.meeting"] ||
+        [bundleIdentifier isEqualToString:@"com.tencent.wemeet"];
+    CGFloat width = CGRectGetWidth(window.frame);
+    CGFloat height = CGRectGetHeight(window.frame);
+    if (dedicatedMeetingApplication) return width >= 280 && height >= 160;
+    return width >= 560 && height >= 300;
+}
+
+- (void)startProbeForContent:(SCShareableContent *)content runningBundleIdentifiers:(NSSet<NSString *> *)runningBundleIdentifiers {
+    NSDictionary<NSString *, NSString *> *knownApplications = [self monitoredApplications];
+    NSString *selectedBundleIdentifier = nil;
+    SCWindow *selectedWindow = nil;
+    for (SCWindow *window in content.windows) {
+        NSString *bundleIdentifier = window.owningApplication.bundleIdentifier;
+        if (![runningBundleIdentifiers containsObject:bundleIdentifier]) continue;
+        if ([self windowSuggestsMeeting:window bundleIdentifier:bundleIdentifier]) {
+            selectedBundleIdentifier = bundleIdentifier;
+            selectedWindow = window;
+            break;
+        }
+    }
+    if (!selectedBundleIdentifier) {
+        [self stopProbe];
+        return;
+    }
+
+    NSMutableArray<SCRunningApplication *> *includedApplications = [NSMutableArray array];
+    for (SCRunningApplication *application in content.applications) {
+        if ([application.bundleIdentifier isEqualToString:selectedBundleIdentifier]) [includedApplications addObject:application];
+    }
+    if (includedApplications.count == 0) return;
+
+    SCDisplay *selectedDisplay = content.displays.firstObject;
+    CGDirectDisplayID mainDisplayID = CGMainDisplayID();
+    for (SCDisplay *display in content.displays) {
+        if (display.displayID == mainDisplayID) {
+            selectedDisplay = display;
+            break;
+        }
+    }
+    if (selectedWindow) {
+        CGPoint windowCenter = CGPointMake(CGRectGetMidX(selectedWindow.frame), CGRectGetMidY(selectedWindow.frame));
+        for (SCDisplay *display in content.displays) {
+            if (CGRectContainsPoint(display.frame, windowCenter)) {
+                selectedDisplay = display;
+                break;
+            }
+        }
+    }
+    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:selectedDisplay includingApplications:includedApplications exceptingWindows:@[]];
+    SCStreamConfiguration *configuration = [[SCStreamConfiguration alloc] init];
+    configuration.capturesAudio = YES;
+    configuration.excludesCurrentProcessAudio = YES;
+    configuration.sampleRate = 16000;
+    configuration.channelCount = 1;
+    configuration.width = 2;
+    configuration.height = 2;
+    configuration.minimumFrameInterval = CMTimeMake(1, 1);
+    configuration.queueDepth = 1;
+
+    self.activeAudioSeconds = 0;
+    self.probeBundleIdentifier = selectedBundleIdentifier;
+    self.detectedApplicationName = knownApplications[selectedBundleIdentifier];
+    SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:self];
+    NSError *outputError = nil;
+    if (![stream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:self.audioQueue error:&outputError]) return;
+    self.probeStream = stream;
+    __weak typeof(self) weakSelf = self;
+    [stream startCaptureWithCompletionHandler:^(NSError *startError) {
+        if (!startError) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (weakSelf.probeStream == stream) [weakSelf stopProbe];
+        });
+    }];
+}
+
+- (void)stopProbe {
+    SCStream *stream = self.probeStream;
+    self.probeStream = nil;
+    self.probeStarting = NO;
+    self.probeBundleIdentifier = nil;
+    self.activeAudioSeconds = 0;
+    if (stream) [stream stopCaptureWithCompletionHandler:nil];
+}
+
+- (double)rootMeanSquareForSampleBuffer:(CMSampleBufferRef)sampleBuffer duration:(double *)duration {
+    CMAudioFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
+    const AudioStreamBasicDescription *format = formatDescription
+        ? CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
+        : NULL;
+    if (!format || format->mFormatID != kAudioFormatLinearPCM) return 0;
+    AudioBufferList bufferList;
+    CMBlockBufferRef blockBuffer = NULL;
+    OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sampleBuffer, NULL, &bufferList, sizeof(bufferList), NULL, NULL, 0, &blockBuffer);
+    if (status != noErr) return 0;
+
+    double sum = 0;
+    NSUInteger sampleCount = 0;
+    NSUInteger bytesPerSample = MAX(1, format->mBitsPerChannel / 8);
+    for (UInt32 bufferIndex = 0; bufferIndex < bufferList.mNumberBuffers; bufferIndex++) {
+        AudioBuffer buffer = bufferList.mBuffers[bufferIndex];
+        NSUInteger count = buffer.mDataByteSize / bytesPerSample;
+        if ((format->mFormatFlags & kAudioFormatFlagIsFloat) && bytesPerSample == sizeof(float)) {
+            float *samples = buffer.mData;
+            for (NSUInteger index = 0; index < count; index++) sum += (double)samples[index] * samples[index];
+        } else if ((format->mFormatFlags & kAudioFormatFlagIsSignedInteger) && bytesPerSample == sizeof(int16_t)) {
+            int16_t *samples = buffer.mData;
+            for (NSUInteger index = 0; index < count; index++) {
+                double value = samples[index] / 32768.0;
+                sum += value * value;
+            }
+        } else {
+            continue;
+        }
+        sampleCount += count;
+    }
+    if (blockBuffer) CFRelease(blockBuffer);
+    CMTime sampleDuration = CMSampleBufferGetDuration(sampleBuffer);
+    double seconds = CMTIME_IS_NUMERIC(sampleDuration) ? CMTimeGetSeconds(sampleDuration) : 0;
+    if (seconds <= 0 && format->mSampleRate > 0) seconds = CMSampleBufferGetNumSamples(sampleBuffer) / format->mSampleRate;
+    if (duration) *duration = MAX(0, seconds);
+    return sampleCount > 0 ? sqrt(sum / sampleCount) : 0;
+}
+
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
+    if (type != SCStreamOutputTypeAudio || !CMSampleBufferDataIsReady(sampleBuffer)) return;
+    double duration = 0;
+    double rootMeanSquare = [self rootMeanSquareForSampleBuffer:sampleBuffer duration:&duration];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.enabled || self.recordingActive || self.probeStream != stream) return;
+        if (rootMeanSquare >= 0.006) {
+            self.activeAudioSeconds += duration;
+        } else {
+            self.activeAudioSeconds = MAX(0, self.activeAudioSeconds - duration * 0.5);
+        }
+        if (self.activeAudioSeconds >= 3.0) [self showReminder];
+    });
+}
+
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.probeStream == stream) [self stopProbe];
+    });
+}
+
+- (void)showReminder {
+    if (!self.enabled || self.recordingActive || self.reminderPanel.isVisible) return;
+    [self stopProbe];
+    self.cooldownUntil = [NSDate dateWithTimeIntervalSinceNow:10 * 60];
+    [self updateReminderPanelText];
+    NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+    NSRect visibleFrame = screen.visibleFrame;
+    NSSize size = self.reminderPanel.frame.size;
+    [self.reminderPanel setFrameOrigin:NSMakePoint(NSMaxX(visibleFrame) - size.width - 20,
+                                                    NSMaxY(visibleFrame) - size.height - 20)];
+    [self.reminderPanel orderFrontRegardless];
+    [self.dismissTimer invalidate];
+    self.dismissTimer = [NSTimer scheduledTimerWithTimeInterval:15.0 target:self selector:@selector(dismissReminder:) userInfo:nil repeats:NO];
+}
+
+- (void)hideReminder {
+    [self.dismissTimer invalidate];
+    self.dismissTimer = nil;
+    [self.reminderPanel orderOut:nil];
+}
+
+- (void)dismissReminder:(id)sender {
+    [self hideReminder];
+}
+
+- (void)startRecordingFromReminder:(id)sender {
+    [self hideReminder];
+    self.recordingActive = YES;
+    if (self.startRecordingHandler) self.startRecordingHandler();
+}
+
+@end
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate>
 @property(nonatomic, strong) TranscriptionController *controller;
 @property(nonatomic, strong) NSStatusItem *statusItem;
@@ -1457,8 +1838,13 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, strong) NSMenuItem *transcriptionModeItem;
 @property(nonatomic, strong) NSMenuItem *fastTranscriptionItem;
 @property(nonatomic, strong) NSMenuItem *standardTranscriptionItem;
+@property(nonatomic, strong) NSMenuItem *recordingReminderItem;
+@property(nonatomic, strong) NSMenuItem *reminderOffItem;
+@property(nonatomic, strong) NSMenuItem *reminderAutomaticItem;
 @property(nonatomic, copy) NSString *interfaceLanguage;
 @property(nonatomic, copy) NSString *transcriptionMode;
+@property(nonatomic, copy) NSString *recordingReminderMode;
+@property(nonatomic, strong) MeetingReminderMonitor *meetingReminderMonitor;
 @property(nonatomic, strong) id shortcutMonitor;
 @property(nonatomic) EventHotKeyRef recordingHotKey;
 @property(nonatomic) EventHandlerRef hotKeyEventHandler;
@@ -1489,6 +1875,7 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     [NSUserDefaults.standardUserDefaults registerDefaults:@{
         @"SnackRecordInterfaceLanguage": @"zh",
         @"SnackRecordTranscriptionMode": TranscriptionModeFast,
+        @"SnackRecordReminderMode": @"off",
     }];
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"SnackRecordChineseDefaultsApplied"]) {
         [NSUserDefaults.standardUserDefaults setObject:@"zh" forKey:@"SnackRecordInterfaceLanguage"];
@@ -1496,19 +1883,27 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     }
     self.interfaceLanguage = [NSUserDefaults.standardUserDefaults stringForKey:@"SnackRecordInterfaceLanguage"] ?: @"en";
     self.transcriptionMode = [NSUserDefaults.standardUserDefaults stringForKey:@"SnackRecordTranscriptionMode"] ?: TranscriptionModeFast;
+    self.recordingReminderMode = [NSUserDefaults.standardUserDefaults stringForKey:@"SnackRecordReminderMode"] ?: @"off";
     NSImage *applicationIcon = RoundedApplicationIcon();
     if (applicationIcon) NSApp.applicationIconImage = applicationIcon;
     self.controller = [[TranscriptionController alloc] init];
     [self.controller applyInterfaceLanguage:self.interfaceLanguage];
     [self.controller applyTranscriptionMode:self.transcriptionMode];
+    self.meetingReminderMonitor = [[MeetingReminderMonitor alloc] init];
+    [self.meetingReminderMonitor applyInterfaceLanguage:self.interfaceLanguage];
+    __weak typeof(self) weakSelf = self;
+    self.meetingReminderMonitor.startRecordingHandler = ^{ [weakSelf.controller startRecordingIfNeeded]; };
     self.controller.window.miniwindowImage = applicationIcon;
     self.controller.window.miniwindowTitle = @"Snack Record";
     [self configureStatusItem];
     [self configureMainMenu];
-    __weak typeof(self) weakSelf = self;
-    self.controller.stateDidChange = ^(TranscriptionState state) { [weakSelf updateStatusItemForState:state]; };
+    self.controller.stateDidChange = ^(TranscriptionState state) {
+        [weakSelf updateStatusItemForState:state];
+        [weakSelf.meetingReminderMonitor setRecordingActive:state == TranscriptionStateRecording];
+    };
     [self updateStatusItemForState:TranscriptionStateReady];
     [self configureShortcut];
+    [self.meetingReminderMonitor setMonitoringEnabled:[self.recordingReminderMode isEqualToString:@"automatic"]];
     [self.controller showWindow];
 }
 
@@ -1568,6 +1963,9 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     self.fastTranscriptionItem.title = chinese ? @"快速转写（不区分说话人）" : @"Fast transcription (no speakers)";
     self.standardTranscriptionItem.title = chinese ? @"标准转写（区分说话人）" : @"Standard transcription (speakers)";
     self.interfaceLanguageItem.title = chinese ? @"系统语言" : @"Language";
+    self.recordingReminderItem.title = chinese ? @"录音提醒" : @"Recording reminders";
+    self.reminderOffItem.title = chinese ? @"不提醒" : @"Off";
+    self.reminderAutomaticItem.title = chinese ? @"自动提醒" : @"Automatic reminders";
     self.showWindowItem.title = chinese ? @"显示窗口" : @"Show window";
     self.quitItem.title = chinese ? @"退出 Snack Record" : @"Quit Snack Record";
     self.mainQuitItem.title = chinese ? @"退出 Snack Record" : @"Quit Snack Record";
@@ -1576,12 +1974,16 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     BOOL standard = [self.transcriptionMode isEqualToString:TranscriptionModeStandard];
     self.fastTranscriptionItem.state = standard ? NSControlStateValueOff : NSControlStateValueOn;
     self.standardTranscriptionItem.state = standard ? NSControlStateValueOn : NSControlStateValueOff;
+    BOOL automaticReminder = [self.recordingReminderMode isEqualToString:@"automatic"];
+    self.reminderOffItem.state = automaticReminder ? NSControlStateValueOff : NSControlStateValueOn;
+    self.reminderAutomaticItem.state = automaticReminder ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
 - (void)changeInterfaceLanguage:(NSString *)language {
     self.interfaceLanguage = [language isEqualToString:@"zh"] ? @"zh" : @"en";
     [NSUserDefaults.standardUserDefaults setObject:self.interfaceLanguage forKey:@"SnackRecordInterfaceLanguage"];
     [self.controller applyInterfaceLanguage:self.interfaceLanguage];
+    [self.meetingReminderMonitor applyInterfaceLanguage:self.interfaceLanguage];
     [self updateLanguageMenus];
 }
 
@@ -1599,6 +2001,16 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
 
 - (void)selectFastTranscription:(id)sender { [self changeTranscriptionMode:TranscriptionModeFast]; }
 - (void)selectStandardTranscription:(id)sender { [self changeTranscriptionMode:TranscriptionModeStandard]; }
+
+- (void)changeRecordingReminderMode:(NSString *)mode {
+    self.recordingReminderMode = [mode isEqualToString:@"automatic"] ? @"automatic" : @"off";
+    [NSUserDefaults.standardUserDefaults setObject:self.recordingReminderMode forKey:@"SnackRecordReminderMode"];
+    [self.meetingReminderMonitor setMonitoringEnabled:[self.recordingReminderMode isEqualToString:@"automatic"]];
+    [self updateLanguageMenus];
+}
+
+- (void)disableRecordingReminders:(id)sender { [self changeRecordingReminderMode:@"off"]; }
+- (void)enableAutomaticRecordingReminders:(id)sender { [self changeRecordingReminderMode:@"automatic"]; }
 
 - (void)configureStatusItem {
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
@@ -1627,6 +2039,17 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     [transcriptionModeMenu addItem:self.standardTranscriptionItem];
     self.transcriptionModeItem.submenu = transcriptionModeMenu;
     [menu addItem:self.transcriptionModeItem];
+
+    self.recordingReminderItem = [[NSMenuItem alloc] initWithTitle:@"Recording reminders" action:nil keyEquivalent:@""];
+    NSMenu *recordingReminderMenu = [[NSMenu alloc] initWithTitle:@"Recording reminders"];
+    self.reminderOffItem = [[NSMenuItem alloc] initWithTitle:@"Off" action:@selector(disableRecordingReminders:) keyEquivalent:@""];
+    self.reminderOffItem.target = self;
+    [recordingReminderMenu addItem:self.reminderOffItem];
+    self.reminderAutomaticItem = [[NSMenuItem alloc] initWithTitle:@"Automatic reminders" action:@selector(enableAutomaticRecordingReminders:) keyEquivalent:@""];
+    self.reminderAutomaticItem.target = self;
+    [recordingReminderMenu addItem:self.reminderAutomaticItem];
+    self.recordingReminderItem.submenu = recordingReminderMenu;
+    [menu addItem:self.recordingReminderItem];
 
     self.interfaceLanguageItem = [[NSMenuItem alloc] initWithTitle:@"Language" action:nil keyEquivalent:@""];
     NSMenu *interfaceMenu = [[NSMenu alloc] initWithTitle:@"Language"];
@@ -1699,6 +2122,7 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     if (self.shortcutMonitor) [NSEvent removeMonitor:self.shortcutMonitor];
     if (self.recordingHotKey) UnregisterEventHotKey(self.recordingHotKey);
     if (self.hotKeyEventHandler) RemoveEventHandler(self.hotKeyEventHandler);
+    [self.meetingReminderMonitor stop];
     [self.controller shutdownWorker];
 }
 

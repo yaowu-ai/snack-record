@@ -12,6 +12,7 @@ Local macOS meeting recorder and Chinese transcription app powered by FunASR.
 - Offers fast transcription without speaker labels and standard transcription with speaker diarization.
 - Shows transcription percentage and estimated remaining time for long audio.
 - Preloads the local models once at app launch and reuses them across transcription tasks.
+- Optionally detects likely meetings in WeCom, Feishu, Tencent Meeting, and Zoom, then shows a local recording reminder.
 - Supports Chinese and English UI.
 
 ## AI coding tool installation
@@ -52,6 +53,7 @@ Runtime files and models are stored under:
 - Recordings and task metadata are not uploaded by Snack Record.
 - Model files are downloaded from ModelScope during installation.
 - ScreenCaptureKit permission is used to capture system audio; screen video is not saved.
+- Meeting reminders are off by default. When enabled, the app checks matching meeting windows and audio energy in memory without saving probe audio.
 
 See [PRIVACY.md](PRIVACY.md) for storage locations and deletion behavior.
 
