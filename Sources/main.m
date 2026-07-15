@@ -163,6 +163,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, strong) NSTextField *tasksTitleLabel;
 @property(nonatomic, strong) NSTextField *statusLabel;
 @property(nonatomic, strong) NSButton *recordButton;
+@property(nonatomic, strong) NSButton *settingsButton;
 @property(nonatomic, strong) NSButton *importButton;
 @property(nonatomic, strong) NSButton *clearJobsButton;
 @property(nonatomic, strong) NSScrollView *jobsScrollView;
@@ -196,6 +197,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, copy) NSString *transcriptionMode;
 @property(nonatomic) BOOL waitingForMicrophonePermission;
 @property(nonatomic, copy) void (^stateDidChange)(TranscriptionState state);
+@property(nonatomic, copy) void (^showSettingsHandler)(void);
 - (void)toggleRecording;
 - (void)startRecordingIfNeeded;
 - (void)stopRecordingIfNeeded;
@@ -323,6 +325,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     [self styleImportButtonTitle];
     self.importButton.toolTip = [self english:@"Choose local audio files to transcribe" chinese:@"选择本地音频文件进行转写"];
     self.clearJobsButton.toolTip = [self english:@"Clear transcription tasks" chinese:@"清空转写任务"];
+    self.settingsButton.toolTip = [self english:@"Settings" chinese:@"设置"];
     [self rebuildJobsView];
     [self renderState:self.currentState message:nil];
 }
@@ -388,6 +391,15 @@ static NSString *const TranscriptionModeStandard = @"standard";
     self.recordButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [view addSubview:self.recordButton];
 
+    self.settingsButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"gearshape" accessibilityDescription:@"Settings"] target:self action:@selector(showSettings:)];
+    self.settingsButton.bezelStyle = NSBezelStyleTexturedRounded;
+    self.settingsButton.imagePosition = NSImageOnly;
+    self.settingsButton.contentTintColor = [NSColor colorWithSRGBRed:0.22 green:0.19 blue:0.16 alpha:0.78];
+    self.settingsButton.toolTip = @"Settings";
+    self.settingsButton.frame = NSMakeRect(382, 443, 34, 34);
+    self.settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [view addSubview:self.settingsButton];
+
     NSBox *divider = [[NSBox alloc] initWithFrame:NSMakeRect(20, 352, 460, 1)];
     divider.boxType = NSBoxSeparator;
     divider.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
@@ -439,6 +451,10 @@ static NSString *const TranscriptionModeStandard = @"standard";
         NSForegroundColorAttributeName: NSColor.whiteColor,
         NSFontAttributeName: [NSFont systemFontOfSize:12 weight:NSFontWeightMedium],
     }];
+}
+
+- (void)showSettings:(id)sender {
+    if (self.showSettingsHandler) self.showSettingsHandler();
 }
 
 - (void)importAudioFiles:(id)sender {
@@ -1841,6 +1857,15 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, strong) NSMenuItem *recordingReminderItem;
 @property(nonatomic, strong) NSMenuItem *reminderOffItem;
 @property(nonatomic, strong) NSMenuItem *reminderAutomaticItem;
+@property(nonatomic, strong) NSPanel *settingsPanel;
+@property(nonatomic, strong) NSTextField *settingsTitleLabel;
+@property(nonatomic, strong) NSTextField *settingsDescriptionLabel;
+@property(nonatomic, strong) NSTextField *languageSettingLabel;
+@property(nonatomic, strong) NSTextField *transcriptionSettingLabel;
+@property(nonatomic, strong) NSTextField *reminderSettingLabel;
+@property(nonatomic, strong) NSPopUpButton *languageSettingPopup;
+@property(nonatomic, strong) NSPopUpButton *transcriptionSettingPopup;
+@property(nonatomic, strong) NSPopUpButton *reminderSettingPopup;
 @property(nonatomic, copy) NSString *interfaceLanguage;
 @property(nonatomic, copy) NSString *transcriptionMode;
 @property(nonatomic, copy) NSString *recordingReminderMode;
@@ -1893,10 +1918,12 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     [self.meetingReminderMonitor applyInterfaceLanguage:self.interfaceLanguage];
     __weak typeof(self) weakSelf = self;
     self.meetingReminderMonitor.startRecordingHandler = ^{ [weakSelf.controller startRecordingIfNeeded]; };
+    self.controller.showSettingsHandler = ^{ [weakSelf showSettings]; };
     self.controller.window.miniwindowImage = applicationIcon;
     self.controller.window.miniwindowTitle = @"Snack Record";
     [self configureStatusItem];
     [self configureMainMenu];
+    [self configureSettingsPanel];
     self.controller.stateDidChange = ^(TranscriptionState state) {
         [weakSelf updateStatusItemForState:state];
         [weakSelf.meetingReminderMonitor setRecordingActive:state == TranscriptionStateRecording];
@@ -1977,6 +2004,106 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     BOOL automaticReminder = [self.recordingReminderMode isEqualToString:@"automatic"];
     self.reminderOffItem.state = automaticReminder ? NSControlStateValueOff : NSControlStateValueOn;
     self.reminderAutomaticItem.state = automaticReminder ? NSControlStateValueOn : NSControlStateValueOff;
+    [self updateSettingsPanel];
+}
+
+- (NSTextField *)settingsLabelWithFrame:(NSRect)frame {
+    NSTextField *label = [NSTextField labelWithString:@""];
+    label.frame = frame;
+    label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    label.textColor = NSColor.labelColor;
+    return label;
+}
+
+- (void)configureSettingsPanel {
+    self.settingsPanel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 440, 270)
+                                                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+    self.settingsPanel.releasedWhenClosed = NO;
+    self.settingsPanel.title = @"Settings";
+    self.settingsPanel.backgroundColor = AppBackground();
+    NSView *view = self.settingsPanel.contentView;
+
+    self.settingsTitleLabel = [NSTextField labelWithString:@"Menu bar settings"];
+    self.settingsTitleLabel.frame = NSMakeRect(24, 214, 392, 28);
+    self.settingsTitleLabel.font = [NSFont systemFontOfSize:20 weight:NSFontWeightSemibold];
+    self.settingsTitleLabel.textColor = NSColor.labelColor;
+    [view addSubview:self.settingsTitleLabel];
+
+    self.settingsDescriptionLabel = [NSTextField labelWithString:@"Changes also apply to the menu bar immediately."];
+    self.settingsDescriptionLabel.frame = NSMakeRect(24, 190, 392, 20);
+    self.settingsDescriptionLabel.font = [NSFont systemFontOfSize:12];
+    self.settingsDescriptionLabel.textColor = NSColor.secondaryLabelColor;
+    [view addSubview:self.settingsDescriptionLabel];
+
+    self.languageSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 145, 142, 25)];
+    self.transcriptionSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 96, 142, 25)];
+    self.reminderSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 47, 142, 25)];
+    [view addSubview:self.languageSettingLabel];
+    [view addSubview:self.transcriptionSettingLabel];
+    [view addSubview:self.reminderSettingLabel];
+
+    self.languageSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 140, 244, 32) pullsDown:NO];
+    [self.languageSettingPopup addItemsWithTitles:@[@"中文", @"English"]];
+    self.languageSettingPopup.target = self;
+    self.languageSettingPopup.action = @selector(changeLanguageFromSettings:);
+    [view addSubview:self.languageSettingPopup];
+
+    self.transcriptionSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 91, 244, 32) pullsDown:NO];
+    [self.transcriptionSettingPopup addItemsWithTitles:@[@"Fast transcription", @"Standard transcription"]];
+    self.transcriptionSettingPopup.target = self;
+    self.transcriptionSettingPopup.action = @selector(changeTranscriptionFromSettings:);
+    [view addSubview:self.transcriptionSettingPopup];
+
+    self.reminderSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 42, 244, 32) pullsDown:NO];
+    [self.reminderSettingPopup addItemsWithTitles:@[@"Off", @"Automatic reminders"]];
+    self.reminderSettingPopup.target = self;
+    self.reminderSettingPopup.action = @selector(changeReminderFromSettings:);
+    [view addSubview:self.reminderSettingPopup];
+
+    [self updateSettingsPanel];
+}
+
+- (void)updateSettingsPanel {
+    if (!self.settingsPanel) return;
+    BOOL chinese = [self isChineseInterface];
+    self.settingsPanel.title = chinese ? @"设置" : @"Settings";
+    self.settingsTitleLabel.stringValue = chinese ? @"菜单栏设置" : @"Menu bar settings";
+    self.settingsDescriptionLabel.stringValue = chinese ? @"修改后会立即同步到顶部菜单栏。" : @"Changes also apply to the menu bar immediately.";
+    self.languageSettingLabel.stringValue = chinese ? @"界面语言" : @"Language";
+    self.transcriptionSettingLabel.stringValue = chinese ? @"转写模式" : @"Transcription mode";
+    self.reminderSettingLabel.stringValue = chinese ? @"录音提醒" : @"Recording reminders";
+    [self.transcriptionSettingPopup itemAtIndex:0].title = chinese ? @"快速转写（不区分说话人）" : @"Fast transcription (no speakers)";
+    [self.transcriptionSettingPopup itemAtIndex:1].title = chinese ? @"标准转写（区分说话人）" : @"Standard transcription (speakers)";
+    [self.reminderSettingPopup itemAtIndex:0].title = chinese ? @"不提醒" : @"Off";
+    [self.reminderSettingPopup itemAtIndex:1].title = chinese ? @"自动提醒" : @"Automatic reminders";
+    [self.languageSettingPopup selectItemAtIndex:chinese ? 0 : 1];
+    [self.transcriptionSettingPopup selectItemAtIndex:[self.transcriptionMode isEqualToString:TranscriptionModeStandard] ? 1 : 0];
+    [self.reminderSettingPopup selectItemAtIndex:[self.recordingReminderMode isEqualToString:@"automatic"] ? 1 : 0];
+}
+
+- (void)showSettings {
+    [self updateSettingsPanel];
+    NSRect parentFrame = self.controller.window.frame;
+    NSRect settingsFrame = self.settingsPanel.frame;
+    NSPoint origin = NSMakePoint(NSMidX(parentFrame) - NSWidth(settingsFrame) / 2.0,
+                                 NSMidY(parentFrame) - NSHeight(settingsFrame) / 2.0);
+    [self.settingsPanel setFrameOrigin:origin];
+    [self.settingsPanel makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)changeLanguageFromSettings:(NSPopUpButton *)sender {
+    [self changeInterfaceLanguage:sender.indexOfSelectedItem == 0 ? @"zh" : @"en"];
+}
+
+- (void)changeTranscriptionFromSettings:(NSPopUpButton *)sender {
+    [self changeTranscriptionMode:sender.indexOfSelectedItem == 1 ? TranscriptionModeStandard : TranscriptionModeFast];
+}
+
+- (void)changeReminderFromSettings:(NSPopUpButton *)sender {
+    [self changeRecordingReminderMode:sender.indexOfSelectedItem == 1 ? @"automatic" : @"off"];
 }
 
 - (void)changeInterfaceLanguage:(NSString *)language {
