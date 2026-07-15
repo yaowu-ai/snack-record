@@ -1497,13 +1497,24 @@ static NSString *const TranscriptionModeStandard = @"standard";
 
 - (NSDictionary<NSString *, NSString *> *)monitoredApplications {
     return @{
-        @"com.tencent.WeWorkMac": @"企业微信",
+        @"com.tencent.wwmapp": @"企业微信",
         @"com.electron.lark": @"飞书",
         @"com.bytedance.ee.lark": @"飞书",
         @"com.tencent.meeting": @"腾讯会议",
         @"com.tencent.wemeet": @"腾讯会议",
         @"us.zoom.xos": @"Zoom",
     };
+}
+
+- (BOOL)isWeComBundleIdentifier:(NSString *)bundleIdentifier {
+    return [bundleIdentifier isEqualToString:@"com.tencent.wwmapp"];
+}
+
+- (BOOL)isDedicatedMeetingBundleIdentifier:(NSString *)bundleIdentifier {
+    return [bundleIdentifier isEqualToString:@"com.tencent.wwmapp"] ||
+        [bundleIdentifier isEqualToString:@"us.zoom.xos"] ||
+        [bundleIdentifier isEqualToString:@"com.tencent.meeting"] ||
+        [bundleIdentifier isEqualToString:@"com.tencent.wemeet"];
 }
 
 - (BOOL)isChineseInterface {
@@ -1628,7 +1639,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     self.probeStarting = YES;
     __weak typeof(self) weakSelf = self;
     [SCShareableContent getShareableContentExcludingDesktopWindows:YES
-                                               onScreenWindowsOnly:YES
+                                               onScreenWindowsOnly:NO
                                                  completionHandler:^(SCShareableContent *content, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
@@ -1645,6 +1656,11 @@ static NSString *const TranscriptionModeStandard = @"standard";
                         break;
                     }
                 }
+                if (!meetingWindowStillVisible &&
+                    [strongSelf isDedicatedMeetingBundleIdentifier:strongSelf.probeBundleIdentifier] &&
+                    [runningBundleIdentifiers containsObject:strongSelf.probeBundleIdentifier]) {
+                    meetingWindowStillVisible = YES;
+                }
                 if (meetingWindowStillVisible) return;
                 [strongSelf stopProbe];
             }
@@ -1655,17 +1671,17 @@ static NSString *const TranscriptionModeStandard = @"standard";
 
 - (BOOL)windowSuggestsMeeting:(SCWindow *)window bundleIdentifier:(NSString *)bundleIdentifier {
     NSString *title = window.title.lowercaseString ?: @"";
-    NSArray<NSString *> *keywords = @[@"会议", @"通话", @"视频", @"meeting", @"call", @"zoom"];
+    NSArray<NSString *> *keywords = @[@"会议", @"通话", @"meeting", @"call", @"conference", @"zoom"];
     for (NSString *keyword in keywords) {
         if ([title containsString:keyword]) return YES;
     }
-    BOOL dedicatedMeetingApplication = [bundleIdentifier isEqualToString:@"us.zoom.xos"] ||
-        [bundleIdentifier isEqualToString:@"com.tencent.meeting"] ||
-        [bundleIdentifier isEqualToString:@"com.tencent.wemeet"];
+    BOOL feishu = [bundleIdentifier isEqualToString:@"com.electron.lark"] ||
+        [bundleIdentifier isEqualToString:@"com.bytedance.ee.lark"];
+    if (feishu) return NO;
     CGFloat width = CGRectGetWidth(window.frame);
     CGFloat height = CGRectGetHeight(window.frame);
-    if (dedicatedMeetingApplication) return width >= 280 && height >= 160;
-    return width >= 560 && height >= 300;
+    if ([self isDedicatedMeetingBundleIdentifier:bundleIdentifier]) return width >= 160 && height >= 100;
+    return NO;
 }
 
 - (void)startProbeForContent:(SCShareableContent *)content runningBundleIdentifiers:(NSSet<NSString *> *)runningBundleIdentifiers {
@@ -1682,13 +1698,24 @@ static NSString *const TranscriptionModeStandard = @"standard";
         }
     }
     if (!selectedBundleIdentifier) {
+        for (NSString *bundleIdentifier in runningBundleIdentifiers) {
+            if ([self isDedicatedMeetingBundleIdentifier:bundleIdentifier]) {
+                selectedBundleIdentifier = bundleIdentifier;
+                break;
+            }
+        }
+    }
+    if (!selectedBundleIdentifier) {
         [self stopProbe];
         return;
     }
 
     NSMutableArray<SCRunningApplication *> *includedApplications = [NSMutableArray array];
     for (SCRunningApplication *application in content.applications) {
-        if ([application.bundleIdentifier isEqualToString:selectedBundleIdentifier]) [includedApplications addObject:application];
+        BOOL selectedApplication = [application.bundleIdentifier isEqualToString:selectedBundleIdentifier];
+        BOOL selectedWeComFamily = [self isWeComBundleIdentifier:selectedBundleIdentifier] &&
+            [self isWeComBundleIdentifier:application.bundleIdentifier];
+        if (selectedApplication || selectedWeComFamily) [includedApplications addObject:application];
     }
     if (includedApplications.count == 0) return;
 
@@ -1730,6 +1757,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     __weak typeof(self) weakSelf = self;
     [stream startCaptureWithCompletionHandler:^(NSError *startError) {
         if (!startError) return;
+        NSLog(@"Snack Record meeting reminder audio probe failed: %@", startError.localizedDescription);
         dispatch_async(dispatch_get_main_queue(), ^{
             if (weakSelf.probeStream == stream) [weakSelf stopProbe];
         });
@@ -1791,7 +1819,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     double rootMeanSquare = [self rootMeanSquareForSampleBuffer:sampleBuffer duration:&duration];
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.enabled || self.recordingActive || self.probeStream != stream) return;
-        if (rootMeanSquare >= 0.006) {
+        if (rootMeanSquare >= 0.002) {
             self.activeAudioSeconds += duration;
         } else {
             self.activeAudioSeconds = MAX(0, self.activeAudioSeconds - duration * 0.5);
