@@ -3,7 +3,10 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +37,51 @@ def local_model_directories() -> tuple[Path, Path, Path, Path]:
 def normalize_text(text: str) -> str:
     text = text.strip()
     return re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", text)
+
+
+def normalized_audio_path(input_path: Path) -> tuple[Path, Path | None]:
+    if input_path.suffix.lower() == ".wav":
+        return input_path, None
+
+    ffmpeg = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg")
+    if not ffmpeg:
+        for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if Path(candidate).is_file():
+                ffmpeg = candidate
+                break
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to decode this audio format")
+
+    temporary = tempfile.NamedTemporaryFile(prefix="snack-record-", suffix=".wav", delete=False)
+    temporary.close()
+    output_path = Path(temporary.name)
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        output_path.unlink(missing_ok=True)
+        detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
+        raise RuntimeError(f"Unable to decode audio: {detail}")
+    return output_path, output_path
 
 
 def relative_time(milliseconds: int) -> str:
@@ -148,26 +196,32 @@ def transcribe(
     mode: str,
     reporter: ProgressReporter,
 ) -> None:
-    reporter.emit(5.0)
+    reporter.emit(2.0)
     speaker_model = model.spk_model
     if mode == "fast":
         model.spk_model = None
-    original_inference = install_progress_bridge(model, reporter, mode)
+    original_inference = None
+    temporary_audio = None
     try:
+        prepared_input, temporary_audio = normalized_audio_path(input_path)
+        reporter.emit(5.0)
+        original_inference = install_progress_bridge(model, reporter, mode)
         results = model.generate(
-            input=str(input_path),
+            input=str(prepared_input),
             batch_size_s=300,
             sentence_timestamp=mode == "fast",
         )
     finally:
-        model.inference = original_inference
+        if original_inference is not None:
+            model.inference = original_inference
         model.spk_model = speaker_model
+        if temporary_audio is not None:
+            temporary_audio.unlink(missing_ok=True)
 
-    if not results:
-        raise RuntimeError("FunASR returned no transcribed text")
     reporter.emit(98.0)
 
-    sentences = results[0].get("sentence_info") or []
+    result = results[0] if results else {}
+    sentences = result.get("sentence_info") or []
     lines = [f"录音开始时间：{start_time}", ""]
     if sentences:
         for sentence in sentences:
@@ -181,13 +235,13 @@ def transcribe(
             else:
                 lines.append(f"[{timestamp}] {text}")
     else:
-        text = normalize_text(results[0].get("text", ""))
+        text = normalize_text(result.get("text", ""))
         if text:
             prefix = "说话人 1：" if mode == "standard" else ""
             lines.append(f"[00:00:00] {prefix}{text}")
 
     if len(lines) == 2:
-        raise RuntimeError("FunASR returned no transcribed text")
+        lines.append("[00:00:00] 未检测到可识别的对话声音")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

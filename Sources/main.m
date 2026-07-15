@@ -205,6 +205,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 - (void)applyTranscriptionMode:(NSString *)mode;
 - (void)preloadModels;
 - (void)transcribeJob:(TranscriptionJob *)job;
+- (BOOL)runWorkerRequest:(NSData *)requestData forJob:(TranscriptionJob *)job;
 - (void)shutdownWorker;
 @end
 
@@ -915,6 +916,8 @@ static NSString *const TranscriptionModeStandard = @"standard";
         [environment removeObjectForKey:@"MODELSCOPE_CACHE"];
     }
     environment[@"PYTHONUNBUFFERED"] = @"1";
+    NSString *ffmpeg = FFmpegExecutablePath();
+    if (ffmpeg) environment[@"FFMPEG_PATH"] = ffmpeg;
     return environment;
 }
 
@@ -996,6 +999,34 @@ static NSString *const TranscriptionModeStandard = @"standard";
     if (self.modelWorkerTask.isRunning) [self.modelWorkerTask terminate];
 }
 
+- (BOOL)runWorkerRequest:(NSData *)requestData forJob:(TranscriptionJob *)job {
+    if (![self startWorkerIfNeeded]) return NO;
+    @try {
+        [self.modelWorkerInput writeData:requestData];
+    } @catch (NSException *exception) {
+        return NO;
+    }
+
+    job.task = self.modelWorkerTask;
+    BOOL completed = NO;
+    while (self.modelWorkerTask.isRunning && !job.cancelled) {
+        NSDictionary *event = [self readWorkerEvent];
+        if (!event) break;
+        if (![event[@"id"] isEqualToString:job.identifier]) continue;
+        NSString *type = event[@"type"];
+        if ([type isEqualToString:@"progress"]) {
+            [self updateProgress:[event[@"percent"] doubleValue] forJob:job];
+        } else if ([type isEqualToString:@"completed"]) {
+            completed = YES;
+            break;
+        } else if ([type isEqualToString:@"error"]) {
+            break;
+        }
+    }
+    job.task = nil;
+    return completed && [NSFileManager.defaultManager fileExistsAtPath:job.temporaryOutputURL.path];
+}
+
 - (void)transcribeJob:(TranscriptionJob *)job {
     dispatch_async(self.transcriptionQueue, ^{
         if (job.cancelled) return;
@@ -1014,11 +1045,6 @@ static NSString *const TranscriptionModeStandard = @"standard";
             [self failJob:job message:[self english:@"Local FunASR environment not found" chinese:@"未找到本地环境"]];
             return;
         }
-        if (![self startWorkerIfNeeded]) {
-            [self failJob:job message:[self english:@"Unable to start the local model worker" chinese:@"无法启动本地模型服务"]];
-            return;
-        }
-
         NSDateFormatter *startFormatter = [[NSDateFormatter alloc] init];
         startFormatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"zh_CN"];
         startFormatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
@@ -1034,39 +1060,28 @@ static NSString *const TranscriptionModeStandard = @"standard";
         };
         NSMutableData *requestData = [[NSJSONSerialization dataWithJSONObject:request options:0 error:nil] mutableCopy];
         [requestData appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
-        @try {
-            [self.modelWorkerInput writeData:requestData];
-        } @catch (NSException *exception) {
+        BOOL completed = NO;
+        for (NSInteger attempt = 0; attempt < 2 && !job.cancelled; attempt++) {
+            completed = [self runWorkerRequest:requestData forJob:job];
+            if (completed) break;
+            [NSFileManager.defaultManager removeItemAtURL:job.temporaryOutputURL error:nil];
             [self shutdownWorker];
             [self clearWorkerReferences];
-            [self failJob:job message:[self english:@"The local model worker stopped" chinese:@"本地模型服务已停止"]];
-            return;
-        }
-
-        job.task = self.modelWorkerTask;
-        BOOL completed = NO;
-        BOOL failed = NO;
-        while (self.modelWorkerTask.isRunning && !job.cancelled) {
-            NSDictionary *event = [self readWorkerEvent];
-            if (!event) break;
-            if (![event[@"id"] isEqualToString:job.identifier]) continue;
-            NSString *type = event[@"type"];
-            if ([type isEqualToString:@"progress"]) {
-                [self updateProgress:[event[@"percent"] doubleValue] forJob:job];
-            } else if ([type isEqualToString:@"completed"]) {
-                completed = YES;
-                break;
-            } else if ([type isEqualToString:@"error"]) {
-                failed = YES;
-                break;
+            if (attempt == 0) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    job.progress = 0.0;
+                    job.progressStartedAt = NSDate.date;
+                    job.estimationStartedAt = nil;
+                    job.estimationStartProgress = 0.0;
+                    [self updateJobRow:job];
+                });
             }
         }
-        job.task = nil;
         if (job.cancelled) {
             [NSFileManager.defaultManager removeItemAtURL:job.temporaryOutputURL error:nil];
             return;
         }
-        if (!completed || failed || ![NSFileManager.defaultManager fileExistsAtPath:job.temporaryOutputURL.path]) {
+        if (!completed) {
             if (!self.modelWorkerTask.isRunning) [self clearWorkerReferences];
             [self failJob:job message:[self english:@"Transcription failed" chinese:@"转写失败"]];
             return;
@@ -1264,6 +1279,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.retryButton.contentTintColor = retryColor;
     switch (job.state) {
         case TranscriptionJobStateQueued:
+            job.stateLabel.frame = NSMakeRect(36, 8, job.rowView.bounds.size.width - 136, 19);
             job.stateLabel.stringValue = [self english:@"Waiting…" chinese:@"等待处理…"];
             job.stateLabel.textColor = NSColor.secondaryLabelColor;
             job.progressIndicator.hidden = NO;
@@ -1272,6 +1288,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
             job.filenameField.editable = YES;
             break;
         case TranscriptionJobStateProcessing:
+            job.stateLabel.frame = NSMakeRect(36, 8, job.rowView.bounds.size.width - 136, 19);
             job.stateLabel.stringValue = [self processingTextForJob:job];
             job.stateLabel.textColor = NSColor.secondaryLabelColor;
             job.progressIndicator.hidden = NO;
@@ -1280,6 +1297,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
             job.filenameField.editable = YES;
             break;
         case TranscriptionJobStateFinished:
+            job.stateLabel.frame = NSMakeRect(14, 8, job.rowView.bounds.size.width - 114, 19);
             job.stateLabel.stringValue = outputAvailable
                 ? [self english:@"Complete · Local file available" chinese:@"已完成 · 本地有效"]
                 : [self english:@"Complete · Local file missing" chinese:@"已完成 · 本地失效"];
@@ -1290,6 +1308,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
             job.revealButton.enabled = outputAvailable;
             break;
         case TranscriptionJobStateFailed:
+            job.stateLabel.frame = NSMakeRect(14, 8, job.rowView.bounds.size.width - 114, 19);
             if (job.stateLabel.stringValue.length == 0) job.stateLabel.stringValue = [self english:@"Transcription failed" chinese:@"转写失败"];
             job.stateLabel.textColor = NSColor.systemOrangeColor;
             [job.progressIndicator stopAnimation:nil];
