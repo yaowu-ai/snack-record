@@ -395,11 +395,17 @@ static NSString *const TranscriptionModeStandard = @"standard";
     [view addSubview:self.recordButton];
 
     self.settingsButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"gearshape" accessibilityDescription:@"Settings"] target:self action:@selector(showSettings:)];
-    self.settingsButton.bezelStyle = NSBezelStyleCircular;
+    self.settingsButton.bordered = NO;
     self.settingsButton.imagePosition = NSImageOnly;
     self.settingsButton.contentTintColor = BrandOrange();
     self.settingsButton.toolTip = @"Settings";
     self.settingsButton.frame = NSMakeRect(374, 439, 42, 42);
+    self.settingsButton.wantsLayer = YES;
+    self.settingsButton.layer.backgroundColor = NSColor.whiteColor.CGColor;
+    self.settingsButton.layer.cornerRadius = 21;
+    self.settingsButton.layer.borderColor = [BrandOrange() colorWithAlphaComponent:0.18].CGColor;
+    self.settingsButton.layer.borderWidth = 1;
+    self.settingsButton.layer.masksToBounds = YES;
     self.settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [view addSubview:self.settingsButton];
 
