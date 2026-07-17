@@ -51,8 +51,38 @@ static NSColor *BrandOrange(void) {
     return [NSColor colorWithSRGBRed:1.0 green:0.45 blue:0.0 alpha:1.0];
 }
 
+static NSColor *BrandTeal(void) {
+    return [NSColor colorWithName:nil dynamicProvider:^NSColor *(NSAppearance *appearance) {
+        NSAppearanceName match = [appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+        return [match isEqualToString:NSAppearanceNameDarkAqua]
+            ? [NSColor colorWithSRGBRed:0.16 green:0.72 blue:0.74 alpha:1.0]
+            : [NSColor colorWithSRGBRed:0.0 green:0.34 blue:0.39 alpha:1.0];
+    }];
+}
+
 static NSColor *BrandHeaderBackground(void) {
-    return [NSColor colorWithSRGBRed:1.0 green:0.94 blue:0.89 alpha:1.0];
+    return [NSColor colorWithName:nil dynamicProvider:^NSColor *(NSAppearance *appearance) {
+        NSAppearanceName match = [appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+        return [match isEqualToString:NSAppearanceNameDarkAqua]
+            ? [NSColor colorWithSRGBRed:0.03 green:0.20 blue:0.23 alpha:1.0]
+            : [NSColor colorWithSRGBRed:1.0 green:0.96 blue:0.92 alpha:1.0];
+    }];
+}
+
+static NSColor *BrandHeaderTextColor(void) {
+    return [NSColor colorWithName:nil dynamicProvider:^NSColor *(NSAppearance *appearance) {
+        NSAppearanceName match = [appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+        return [match isEqualToString:NSAppearanceNameDarkAqua] ? NSColor.whiteColor : [NSColor colorWithWhite:0.08 alpha:1.0];
+    }];
+}
+
+static NSColor *BrandHeaderMutedTextColor(void) {
+    return [NSColor colorWithName:nil dynamicProvider:^NSColor *(NSAppearance *appearance) {
+        NSAppearanceName match = [appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+        return [match isEqualToString:NSAppearanceNameDarkAqua]
+            ? [NSColor colorWithWhite:1.0 alpha:0.68]
+            : [NSColor colorWithSRGBRed:0.25 green:0.19 blue:0.15 alpha:0.68];
+    }];
 }
 
 static NSColor *AppBackground(void) {
@@ -137,6 +167,12 @@ static NSString *const TranscriptionModeStandard = @"standard";
     [NSColor.separatorColor setStroke];
     path.lineWidth = 1;
     [path stroke];
+
+    NSBezierPath *accent = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(0, 10, 4, MAX(0, NSHeight(self.bounds) - 20))
+                                                           xRadius:2
+                                                           yRadius:2];
+    [BrandOrange() setFill];
+    [accent fill];
 }
 @end
 
@@ -370,18 +406,30 @@ static NSString *const TranscriptionModeStandard = @"standard";
     brandHeader.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     [view addSubview:brandHeader];
 
-    NSString *logoPath = [NSBundle.mainBundle pathForResource:@"SnackLogo" ofType:@"png"];
-    NSImageView *logoView = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 444, 190, 58)];
-    logoView.image = [[NSImage alloc] initWithContentsOfFile:logoPath];
-    logoView.imageScaling = NSImageScaleProportionallyUpOrDown;
-    logoView.imageAlignment = NSImageAlignLeft;
-    logoView.autoresizingMask = NSViewMinYMargin;
-    [view addSubview:logoView];
+    NSBox *brandAccent = [[NSBox alloc] initWithFrame:NSMakeRect(0, 516, 500, 4)];
+    brandAccent.boxType = NSBoxCustom;
+    brandAccent.borderWidth = 0;
+    brandAccent.fillColor = BrandOrange();
+    brandAccent.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [view addSubview:brandAccent];
+
+    NSImageView *brandIcon = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 423, 72, 72)];
+    brandIcon.image = RoundedApplicationIcon();
+    brandIcon.imageScaling = NSImageScaleProportionallyUpOrDown;
+    brandIcon.autoresizingMask = NSViewMinYMargin;
+    [view addSubview:brandIcon];
+
+    NSTextField *brandTitle = [NSTextField labelWithString:@"Snack Record"];
+    brandTitle.font = [NSFont systemFontOfSize:22 weight:NSFontWeightSemibold];
+    brandTitle.textColor = BrandHeaderTextColor();
+    brandTitle.frame = NSMakeRect(106, 459, 230, 30);
+    brandTitle.autoresizingMask = NSViewMinYMargin;
+    [view addSubview:brandTitle];
 
     self.subtitleLabel = [NSTextField labelWithString:@"RECORD  ·  Local meeting transcription"];
     self.subtitleLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
-    self.subtitleLabel.textColor = [NSColor colorWithSRGBRed:0.16 green:0.14 blue:0.12 alpha:0.72];
-    self.subtitleLabel.frame = NSMakeRect(22, 420, 270, 20);
+    self.subtitleLabel.textColor = BrandHeaderMutedTextColor();
+    self.subtitleLabel.frame = NSMakeRect(107, 432, 230, 20);
     self.subtitleLabel.autoresizingMask = NSViewMinYMargin;
     [view addSubview:self.subtitleLabel];
 
@@ -397,6 +445,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     self.recordButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"mic.fill" accessibilityDescription:@"Start recording"] target:self action:@selector(toggleRecording:)];
     self.recordButton.bordered = NO;
     self.recordButton.imagePosition = NSImageOnly;
+    self.recordButton.image = [self.recordButton.image imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:21 weight:NSFontWeightSemibold]];
     self.recordButton.toolTip = @"Start meeting recording (Control+R)";
     self.recordButton.contentTintColor = NSColor.whiteColor;
     self.recordButton.frame = NSMakeRect(426, 434, 52, 52);
@@ -410,6 +459,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     self.settingsButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"gearshape" accessibilityDescription:@"Settings"] target:self action:@selector(showSettings:)];
     self.settingsButton.bordered = NO;
     self.settingsButton.imagePosition = NSImageOnly;
+    self.settingsButton.image = [self.settingsButton.image imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:19 weight:NSFontWeightMedium]];
     self.settingsButton.contentTintColor = BrandOrange();
     self.settingsButton.toolTip = @"Settings";
     self.settingsButton.frame = NSMakeRect(364, 434, 52, 52);
@@ -429,9 +479,16 @@ static NSString *const TranscriptionModeStandard = @"standard";
 
     self.tasksTitleLabel = [NSTextField labelWithString:@"Transcription tasks"];
     self.tasksTitleLabel.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
-    self.tasksTitleLabel.frame = NSMakeRect(20, 320, 200, 20);
+    self.tasksTitleLabel.frame = NSMakeRect(46, 320, 174, 20);
     self.tasksTitleLabel.autoresizingMask = NSViewMinYMargin;
     [view addSubview:self.tasksTitleLabel];
+
+    NSImageView *tasksIcon = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 319, 18, 18)];
+    tasksIcon.image = [NSImage imageWithSystemSymbolName:@"mic.fill" accessibilityDescription:@"转写任务"];
+    tasksIcon.image = [tasksIcon.image imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:14 weight:NSFontWeightSemibold]];
+    tasksIcon.contentTintColor = BrandOrange();
+    tasksIcon.autoresizingMask = NSViewMinYMargin;
+    [view addSubview:tasksIcon];
 
     self.importButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"square.and.arrow.up" accessibilityDescription:@"上传本地音频文件"] target:self action:@selector(importAudioFiles:)];
     self.importButton.title = @"Upload local audio";
@@ -554,6 +611,12 @@ static NSString *const TranscriptionModeStandard = @"standard";
     card.layer.cornerRadius = 10;
     card.layer.masksToBounds = YES;
     self.recordingPanel.contentView = card;
+
+    NSBox *recordingAccent = [[NSBox alloc] initWithFrame:NSMakeRect(0, 75, 248, 3)];
+    recordingAccent.boxType = NSBoxCustom;
+    recordingAccent.borderWidth = 0;
+    recordingAccent.fillColor = BrandOrange();
+    [card addSubview:recordingAccent];
 
     NSImageView *recordingIcon = [[NSImageView alloc] initWithFrame:NSMakeRect(18, 27, 24, 24)];
     recordingIcon.image = [NSImage imageWithSystemSymbolName:@"record.circle.fill" accessibilityDescription:@"正在录音"];
@@ -1282,7 +1345,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.revealButton.bezelStyle = NSBezelStyleTexturedRounded;
     job.revealButton.imagePosition = NSImageOnly;
     job.revealButton.toolTip = [self english:@"Open transcript" chinese:@"打开转写文件"];
-    job.revealButton.contentTintColor = BrandOrange();
+    job.revealButton.contentTintColor = BrandTeal();
     job.revealButton.tag = [self.jobs indexOfObjectIdenticalTo:job];
     job.revealButton.frame = NSMakeRect(rowWidth - 94, 31, 34, 30);
     job.revealButton.autoresizingMask = NSViewMinXMargin;
@@ -1302,7 +1365,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.meetingNotesButton.bezelStyle = NSBezelStyleTexturedRounded;
     job.meetingNotesButton.imagePosition = NSImageOnly;
     job.meetingNotesButton.toolTip = [self english:@"Create meeting notes in Snack" chinese:@"在 Snack 中生成会议纪要"];
-    job.meetingNotesButton.contentTintColor = NSColor.systemBlueColor;
+    job.meetingNotesButton.contentTintColor = BrandOrange();
     job.meetingNotesButton.identifier = job.identifier;
     job.meetingNotesButton.frame = NSMakeRect(rowWidth - 54, 31, 34, 30);
     job.meetingNotesButton.autoresizingMask = NSViewMinXMargin;
@@ -1572,12 +1635,12 @@ static NSString *const TranscriptionModeStandard = @"standard";
             job.revealButton.enabled = outputAvailable;
             break;
     }
-    job.revealButton.contentTintColor = job.revealButton.enabled ? BrandOrange() : NSColor.tertiaryLabelColor;
+    job.revealButton.contentTintColor = job.revealButton.enabled ? BrandTeal() : NSColor.tertiaryLabelColor;
     job.revealButton.toolTip = outputAvailable
         ? [self english:@"Open transcript" chinese:@"打开转写文件"]
         : [self english:@"File not found" chinese:@"文件未找到"];
     job.meetingNotesButton.enabled = job.state == TranscriptionJobStateFinished && outputAvailable;
-    job.meetingNotesButton.contentTintColor = job.meetingNotesButton.enabled ? NSColor.systemBlueColor : NSColor.tertiaryLabelColor;
+    job.meetingNotesButton.contentTintColor = job.meetingNotesButton.enabled ? BrandOrange() : NSColor.tertiaryLabelColor;
     if (job.state != TranscriptionJobStateFinished) {
         job.meetingNotesButton.toolTip = [self english:@"Available after transcription completes" chinese:@"转写完成后可生成会议纪要"];
     } else if (!outputAvailable) {
@@ -2311,7 +2374,7 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     self.settingsTitleLabel = [NSTextField labelWithString:@"Settings"];
     self.settingsTitleLabel.frame = NSMakeRect(24, 564, 472, 28);
     self.settingsTitleLabel.font = [NSFont systemFontOfSize:20 weight:NSFontWeightSemibold];
-    self.settingsTitleLabel.textColor = NSColor.labelColor;
+    self.settingsTitleLabel.textColor = BrandOrange();
     [view addSubview:self.settingsTitleLabel];
 
     self.settingsDescriptionLabel = [NSTextField labelWithString:@"Changes are saved automatically."];
