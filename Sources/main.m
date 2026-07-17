@@ -13,6 +13,7 @@ static NSString *const SnackRecordOutputDirectoryKey = @"SnackRecordOutputDirect
 static NSString *const SnackRecordDailyFolderKey = @"SnackRecordDailyFolder";
 static NSString *const SnackRecordDefaultMeetingPrompt = @"调用会议纪要 skill 帮我结构化总结下面这段会议转写，不超过 600 字。";
 static NSString *const SnackRecordHandoffMetadataType = @"cn.yaowutech.snack.record-handoff+json";
+static const NSUInteger SnackRecordMaximumHandoffBytes = 5 * 1024 * 1024;
 
 static NSURL *SnackRecordApplicationSupportURL(void) {
     NSURL *applicationSupport = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
@@ -1404,17 +1405,30 @@ static NSString *const TranscriptionModeStandard = @"standard";
         return;
     }
 
+    NSError *readError = nil;
+    NSString *transcript = [NSString stringWithContentsOfURL:job.finalOutputURL encoding:NSUTF8StringEncoding error:&readError];
+    if (!transcript) {
+        [self showMeetingNotesError:[self english:@"The transcript file could not be read." chinese:@"无法读取转写文本文件。"]];
+        return;
+    }
+
     NSString *prompt = [NSUserDefaults.standardUserDefaults stringForKey:SnackRecordMeetingPromptKey];
     if (prompt.length == 0) prompt = SnackRecordDefaultMeetingPrompt;
-    NSData *promptData = [prompt dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *handoffText = [NSString stringWithFormat:@"%@\n\n%@", prompt, transcript];
+    NSData *handoffData = [handoffText dataUsingEncoding:NSUTF8StringEncoding];
+    if (handoffData.length == 0 || handoffData.length > SnackRecordMaximumHandoffBytes) {
+        [self showMeetingNotesError:[self english:@"The prompt and transcript exceed Snack Desktop's 5 MB handoff limit."
+                                            chinese:@"Prompt 与转写文本超过 Snack 桌面端 5 MB 的交接上限。"]];
+        return;
+    }
     NSDate *createdAt = NSDate.date;
     NSDictionary *metadata = @{
         @"version": @1,
         @"source": @"snack-record",
         @"createdAt": [self handoffTimestampForDate:createdAt],
         @"expiresAt": [self handoffTimestampForDate:[createdAt dateByAddingTimeInterval:300]],
-        @"byteLength": @(promptData.length),
-        @"sha256": [self sha256ForData:promptData],
+        @"byteLength": @(handoffData.length),
+        @"sha256": [self sha256ForData:handoffData],
         @"attachmentPath": job.finalOutputURL.path,
         @"attachmentName": job.finalOutputURL.lastPathComponent,
     };
@@ -1426,23 +1440,14 @@ static NSString *const TranscriptionModeStandard = @"standard";
 
     NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
     [pasteboard declareTypes:@[NSPasteboardTypeString, SnackRecordHandoffMetadataType, NSPasteboardTypeFileURL] owner:nil];
-    [pasteboard setString:prompt forType:NSPasteboardTypeString];
+    [pasteboard setString:handoffText forType:NSPasteboardTypeString];
     [pasteboard setData:metadataData forType:SnackRecordHandoffMetadataType];
     [pasteboard setString:job.finalOutputURL.absoluteString forType:NSPasteboardTypeFileURL];
 
     NSURL *deepLink = [NSURL URLWithString:@"snack://chat?source=clipboard"];
-    NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
-    configuration.activates = YES;
-    __weak typeof(self) weakSelf = self;
-    [NSWorkspace.sharedWorkspace openURLs:@[deepLink]
-                    withApplicationAtURL:snackURL
-                           configuration:configuration
-                       completionHandler:^(NSRunningApplication *application, NSError *error) {
-        if (!error) return;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf showMeetingNotesError:[weakSelf english:@"Snack Desktop could not be opened." chinese:@"无法打开 Snack 桌面端。"]];
-        });
-    }];
+    if (![NSWorkspace.sharedWorkspace openURL:deepLink]) {
+        [self showMeetingNotesError:[self english:@"Snack Desktop could not be opened." chinese:@"无法打开 Snack 桌面端。"]];
+    }
 }
 
 - (void)refreshIntegrationAvailability {
