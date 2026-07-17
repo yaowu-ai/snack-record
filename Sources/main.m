@@ -5,7 +5,14 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <UserNotifications/UserNotifications.h>
+#import <CommonCrypto/CommonDigest.h>
 #include <math.h>
+
+static NSString *const SnackRecordMeetingPromptKey = @"SnackRecordMeetingPrompt";
+static NSString *const SnackRecordOutputDirectoryKey = @"SnackRecordOutputDirectory";
+static NSString *const SnackRecordDailyFolderKey = @"SnackRecordDailyFolder";
+static NSString *const SnackRecordDefaultMeetingPrompt = @"调用会议纪要 skill 帮我结构化总结下面这段会议转写，不超过 600 字。";
+static NSString *const SnackRecordHandoffMetadataType = @"cn.yaowutech.snack.record-handoff+json";
 
 static NSURL *SnackRecordApplicationSupportURL(void) {
     NSURL *applicationSupport = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
@@ -150,6 +157,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, strong) NSProgressIndicator *progressIndicator;
 @property(nonatomic, strong) NSButton *revealButton;
 @property(nonatomic, strong) NSButton *retryButton;
+@property(nonatomic, strong) NSButton *meetingNotesButton;
 @property(nonatomic) BOOL cancelled;
 @end
 
@@ -207,6 +215,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 - (void)applyInterfaceLanguage:(NSString *)language;
 - (void)applyTranscriptionMode:(NSString *)mode;
 - (void)preloadModels;
+- (void)refreshIntegrationAvailability;
 - (void)transcribeJob:(TranscriptionJob *)job;
 - (BOOL)runWorkerRequest:(NSData *)requestData forJob:(TranscriptionJob *)job;
 - (void)shutdownWorker;
@@ -237,6 +246,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 }
 
 - (void)showWindow {
+    [self refreshIntegrationAvailability];
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 }
@@ -1139,13 +1149,32 @@ static NSString *const TranscriptionModeStandard = @"standard";
     return safe;
 }
 
-- (NSURL *)availableDesktopURLForFilename:(NSString *)filename {
+- (NSURL *)configuredOutputDirectoryForDate:(NSDate *)date error:(NSError **)error {
+    NSString *configuredPath = [NSUserDefaults.standardUserDefaults stringForKey:SnackRecordOutputDirectoryKey];
     NSURL *desktop = [NSFileManager.defaultManager URLsForDirectory:NSDesktopDirectory inDomains:NSUserDomainMask].firstObject;
-    NSURL *candidate = [desktop URLByAppendingPathComponent:filename];
+    NSURL *directory = configuredPath.length > 0
+        ? [NSURL fileURLWithPath:configuredPath.stringByExpandingTildeInPath isDirectory:YES]
+        : desktop;
+    if ([NSUserDefaults.standardUserDefaults boolForKey:SnackRecordDailyFolderKey]) {
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        formatter.dateFormat = @"yyyy-MM-dd";
+        directory = [directory URLByAppendingPathComponent:[formatter stringFromDate:date ?: NSDate.date] isDirectory:YES];
+    }
+    if (![NSFileManager.defaultManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:error]) {
+        return nil;
+    }
+    return directory;
+}
+
+- (NSURL *)availableOutputURLForFilename:(NSString *)filename error:(NSError **)error {
+    NSURL *directory = [self configuredOutputDirectoryForDate:NSDate.date error:error];
+    if (!directory) return nil;
+    NSURL *candidate = [directory URLByAppendingPathComponent:filename];
     NSString *stem = filename.stringByDeletingPathExtension;
     NSInteger suffix = 2;
     while ([NSFileManager.defaultManager fileExistsAtPath:candidate.path]) {
-        candidate = [desktop URLByAppendingPathComponent:[NSString stringWithFormat:@"%@-%ld.txt", stem, (long)suffix++]];
+        candidate = [directory URLByAppendingPathComponent:[NSString stringWithFormat:@"%@-%ld.txt", stem, (long)suffix++]];
     }
     return candidate;
 }
@@ -1154,8 +1183,15 @@ static NSString *const TranscriptionModeStandard = @"standard";
     if (job.cancelled) return;
     NSString *filename = [self safeFilename:job.filenameField.stringValue];
     job.filenameField.stringValue = filename;
-    NSURL *destination = [self availableDesktopURLForFilename:filename];
     NSError *moveError = nil;
+    NSURL *destination = [self availableOutputURLForFilename:filename error:&moveError];
+    if (!destination) {
+        job.state = TranscriptionJobStateFailed;
+        job.stateLabel.stringValue = [self english:@"Unable to create output folder" chinese:@"无法创建保存目录"];
+        [self updateJobRow:job];
+        [self persistJobs];
+        return;
+    }
     [NSFileManager.defaultManager moveItemAtURL:job.temporaryOutputURL toURL:destination error:&moveError];
     if (moveError) {
         job.state = TranscriptionJobStateFailed;
@@ -1183,8 +1219,9 @@ static NSString *const TranscriptionModeStandard = @"standard";
 - (void)sendCompletionNotificationForURL:(NSURL *)outputURL {
     UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
     content.title = [self english:@"Transcription complete" chinese:@"转写完成"];
-    content.body = [self english:[NSString stringWithFormat:@"Saved %@ to Desktop", outputURL.lastPathComponent]
-                            chinese:[NSString stringWithFormat:@"%@ 已保存到桌面", outputURL.lastPathComponent]];
+    NSString *folder = outputURL.URLByDeletingLastPathComponent.lastPathComponent;
+    content.body = [self english:[NSString stringWithFormat:@"Saved %@ to %@", outputURL.lastPathComponent, folder]
+                            chinese:[NSString stringWithFormat:@"%@ 已保存到 %@", outputURL.lastPathComponent, folder]];
     content.sound = UNNotificationSound.defaultSound;
     UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:NSUUID.UUID.UUIDString content:content trigger:nil];
     [UNUserNotificationCenter.currentNotificationCenter addNotificationRequest:request withCompletionHandler:nil];
@@ -1219,7 +1256,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.rowView = [[TaskCardView alloc] initWithFrame:NSMakeRect(0, y + 4, rowWidth, 70)];
     job.rowView.autoresizingMask = NSViewWidthSizable;
 
-    job.filenameField.frame = NSMakeRect(14, 34, rowWidth - 114, 24);
+    job.filenameField.frame = NSMakeRect(14, 34, rowWidth - 154, 24);
     job.filenameField.autoresizingMask = NSViewWidthSizable;
     job.filenameField.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     job.filenameField.placeholderString = [self english:@"Transcript filename.txt" chinese:@"转写文件名.txt"];
@@ -1234,7 +1271,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.stateLabel = [NSTextField labelWithString:@""];
     job.stateLabel.font = [NSFont systemFontOfSize:11];
     job.stateLabel.textColor = NSColor.secondaryLabelColor;
-    job.stateLabel.frame = NSMakeRect(36, 8, rowWidth - 136, 19);
+    job.stateLabel.frame = NSMakeRect(36, 8, rowWidth - 176, 19);
     job.stateLabel.autoresizingMask = NSViewWidthSizable;
     [job.rowView addSubview:job.stateLabel];
 
@@ -1257,6 +1294,16 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.retryButton.frame = NSMakeRect(rowWidth - 94, 31, 34, 30);
     job.retryButton.autoresizingMask = NSViewMinXMargin;
     [job.rowView addSubview:job.retryButton];
+
+    job.meetingNotesButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"list.bullet.clipboard" accessibilityDescription:@"生成会议纪要"] target:self action:@selector(createMeetingNotes:)];
+    job.meetingNotesButton.bezelStyle = NSBezelStyleTexturedRounded;
+    job.meetingNotesButton.imagePosition = NSImageOnly;
+    job.meetingNotesButton.toolTip = [self english:@"Create meeting notes in Snack" chinese:@"在 Snack 中生成会议纪要"];
+    job.meetingNotesButton.contentTintColor = NSColor.systemBlueColor;
+    job.meetingNotesButton.identifier = job.identifier;
+    job.meetingNotesButton.frame = NSMakeRect(rowWidth - 134, 31, 34, 30);
+    job.meetingNotesButton.autoresizingMask = NSViewMinXMargin;
+    [job.rowView addSubview:job.meetingNotesButton];
     [self updateJobRow:job];
 }
 
@@ -1297,15 +1344,123 @@ static NSString *const TranscriptionModeStandard = @"standard";
                      chinese:[NSString stringWithFormat:@"%@ %ld%% · 预计剩余 %@", modeName, (long)percent, duration]];
 }
 
+- (NSURL *)snackApplicationURL {
+    NSURL *registered = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"cn.yaowutech.snack"];
+    if (registered && [NSFileManager.defaultManager fileExistsAtPath:registered.path]) return registered;
+
+    NSArray<NSString *> *candidates = @[
+        @"~/Desktop/Snack.app",
+        @"~/Applications/Snack.app",
+        @"/Applications/Snack.app",
+    ];
+    for (NSString *candidate in candidates) {
+        NSString *path = candidate.stringByExpandingTildeInPath;
+        NSBundle *bundle = [NSBundle bundleWithPath:path];
+        if ([bundle.bundleIdentifier isEqualToString:@"cn.yaowutech.snack"] &&
+            [NSFileManager.defaultManager fileExistsAtPath:path]) {
+            return [NSURL fileURLWithPath:path isDirectory:YES];
+        }
+    }
+    return nil;
+}
+
+- (NSString *)sha256ForData:(NSData *)data {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    NSMutableString *checksum = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (NSUInteger index = 0; index < CC_SHA256_DIGEST_LENGTH; index++) {
+        [checksum appendFormat:@"%02x", digest[index]];
+    }
+    return checksum;
+}
+
+- (NSString *)handoffTimestampForDate:(NSDate *)date {
+    NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+    formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime;
+    return [formatter stringFromDate:date];
+}
+
+- (void)showMeetingNotesError:(NSString *)message {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = [self english:@"Unable to open meeting notes" chinese:@"无法生成会议纪要"];
+    alert.informativeText = message;
+    [alert addButtonWithTitle:[self english:@"OK" chinese:@"知道了"]];
+    [alert beginSheetModalForWindow:self.window completionHandler:nil];
+}
+
+- (void)createMeetingNotes:(NSButton *)sender {
+    TranscriptionJob *job = nil;
+    for (TranscriptionJob *candidate in self.jobs) {
+        if ([candidate.identifier isEqualToString:sender.identifier]) {
+            job = candidate;
+            break;
+        }
+    }
+    NSURL *snackURL = [self snackApplicationURL];
+    BOOL outputAvailable = job.finalOutputURL && [NSFileManager.defaultManager fileExistsAtPath:job.finalOutputURL.path];
+    if (!job || job.state != TranscriptionJobStateFinished || !outputAvailable || !snackURL) {
+        [self refreshIntegrationAvailability];
+        return;
+    }
+
+    NSString *prompt = [NSUserDefaults.standardUserDefaults stringForKey:SnackRecordMeetingPromptKey];
+    if (prompt.length == 0) prompt = SnackRecordDefaultMeetingPrompt;
+    NSData *promptData = [prompt dataUsingEncoding:NSUTF8StringEncoding];
+    NSDate *createdAt = NSDate.date;
+    NSDictionary *metadata = @{
+        @"version": @1,
+        @"source": @"snack-record",
+        @"createdAt": [self handoffTimestampForDate:createdAt],
+        @"expiresAt": [self handoffTimestampForDate:[createdAt dateByAddingTimeInterval:300]],
+        @"byteLength": @(promptData.length),
+        @"sha256": [self sha256ForData:promptData],
+        @"attachmentPath": job.finalOutputURL.path,
+        @"attachmentName": job.finalOutputURL.lastPathComponent,
+    };
+    NSData *metadataData = [NSJSONSerialization dataWithJSONObject:metadata options:0 error:nil];
+    if (!metadataData) {
+        [self showMeetingNotesError:[self english:@"The handoff data could not be prepared." chinese:@"无法准备交接数据。"]];
+        return;
+    }
+
+    NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
+    [pasteboard declareTypes:@[NSPasteboardTypeString, SnackRecordHandoffMetadataType, NSPasteboardTypeFileURL] owner:nil];
+    [pasteboard setString:prompt forType:NSPasteboardTypeString];
+    [pasteboard setData:metadataData forType:SnackRecordHandoffMetadataType];
+    [pasteboard setString:job.finalOutputURL.absoluteString forType:NSPasteboardTypeFileURL];
+
+    NSURL *deepLink = [NSURL URLWithString:@"snack://chat?source=clipboard"];
+    NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
+    configuration.activates = YES;
+    __weak typeof(self) weakSelf = self;
+    [NSWorkspace.sharedWorkspace openURLs:@[deepLink]
+                    withApplicationAtURL:snackURL
+                           configuration:configuration
+                       completionHandler:^(NSRunningApplication *application, NSError *error) {
+        if (!error) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf showMeetingNotesError:[weakSelf english:@"Snack Desktop could not be opened." chinese:@"无法打开 Snack 桌面端。"]];
+        });
+    }];
+}
+
+- (void)refreshIntegrationAvailability {
+    for (TranscriptionJob *job in self.jobs) {
+        if (job.rowView) [self updateJobRow:job];
+    }
+}
+
 - (void)updateJobRow:(TranscriptionJob *)job {
     BOOL audioAvailable = [NSFileManager.defaultManager fileExistsAtPath:job.recordingURL.path];
     BOOL outputAvailable = job.finalOutputURL && [NSFileManager.defaultManager fileExistsAtPath:job.finalOutputURL.path];
+    BOOL snackAvailable = [self snackApplicationURL] != nil;
     job.retryButton.enabled = audioAvailable && job.state != TranscriptionJobStateQueued && job.state != TranscriptionJobStateProcessing;
     NSColor *retryColor = job.retryButton.enabled ? NSColor.systemBlueColor : NSColor.tertiaryLabelColor;
     job.retryButton.contentTintColor = retryColor;
     switch (job.state) {
         case TranscriptionJobStateQueued:
-            job.stateLabel.frame = NSMakeRect(36, 8, job.rowView.bounds.size.width - 136, 19);
+            job.stateLabel.frame = NSMakeRect(36, 8, job.rowView.bounds.size.width - 176, 19);
             job.stateLabel.stringValue = [self english:@"Waiting…" chinese:@"等待处理…"];
             job.stateLabel.textColor = NSColor.secondaryLabelColor;
             job.progressIndicator.hidden = NO;
@@ -1314,7 +1469,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
             job.filenameField.editable = YES;
             break;
         case TranscriptionJobStateProcessing:
-            job.stateLabel.frame = NSMakeRect(36, 8, job.rowView.bounds.size.width - 136, 19);
+            job.stateLabel.frame = NSMakeRect(36, 8, job.rowView.bounds.size.width - 176, 19);
             job.stateLabel.stringValue = [self processingTextForJob:job];
             job.stateLabel.textColor = NSColor.secondaryLabelColor;
             job.progressIndicator.hidden = NO;
@@ -1323,7 +1478,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
             job.filenameField.editable = YES;
             break;
         case TranscriptionJobStateFinished:
-            job.stateLabel.frame = NSMakeRect(14, 8, job.rowView.bounds.size.width - 114, 19);
+            job.stateLabel.frame = NSMakeRect(14, 8, job.rowView.bounds.size.width - 154, 19);
             job.stateLabel.stringValue = outputAvailable
                 ? [self english:@"Complete · Local file available" chinese:@"已完成 · 本地有效"]
                 : [self english:@"Complete · Local file missing" chinese:@"已完成 · 本地失效"];
@@ -1334,7 +1489,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
             job.revealButton.enabled = outputAvailable;
             break;
         case TranscriptionJobStateFailed:
-            job.stateLabel.frame = NSMakeRect(14, 8, job.rowView.bounds.size.width - 114, 19);
+            job.stateLabel.frame = NSMakeRect(14, 8, job.rowView.bounds.size.width - 154, 19);
             if (job.stateLabel.stringValue.length == 0) job.stateLabel.stringValue = [self english:@"Transcription failed" chinese:@"转写失败"];
             job.stateLabel.textColor = NSColor.systemOrangeColor;
             [job.progressIndicator stopAnimation:nil];
@@ -1347,6 +1502,17 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.revealButton.toolTip = outputAvailable
         ? [self english:@"Open transcript" chinese:@"打开转写文件"]
         : [self english:@"File not found" chinese:@"文件未找到"];
+    job.meetingNotesButton.enabled = job.state == TranscriptionJobStateFinished && outputAvailable && snackAvailable;
+    job.meetingNotesButton.contentTintColor = job.meetingNotesButton.enabled ? NSColor.systemBlueColor : NSColor.tertiaryLabelColor;
+    if (job.state != TranscriptionJobStateFinished) {
+        job.meetingNotesButton.toolTip = [self english:@"Available after transcription completes" chinese:@"转写完成后可生成会议纪要"];
+    } else if (!outputAvailable) {
+        job.meetingNotesButton.toolTip = [self english:@"Transcript file not found" chinese:@"转写文件未找到"];
+    } else if (!snackAvailable) {
+        job.meetingNotesButton.toolTip = [self english:@"Snack Desktop not found" chinese:@"未检测到 Snack 桌面端"];
+    } else {
+        job.meetingNotesButton.toolTip = [self english:@"Create meeting notes in Snack" chinese:@"在 Snack 中生成会议纪要"];
+    }
     if (!audioAvailable && job.state != TranscriptionJobStateProcessing) {
         job.retryButton.enabled = NO;
         job.retryButton.toolTip = [self english:@"Audio cache not found" chinese:@"音频缓存未找到"];
@@ -1871,7 +2037,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 
 @end
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate, NSTextViewDelegate>
 @property(nonatomic, strong) TranscriptionController *controller;
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSImage *statusIcon;
@@ -1895,9 +2061,17 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, strong) NSTextField *languageSettingLabel;
 @property(nonatomic, strong) NSTextField *transcriptionSettingLabel;
 @property(nonatomic, strong) NSTextField *reminderSettingLabel;
+@property(nonatomic, strong) NSTextField *meetingPromptSettingLabel;
+@property(nonatomic, strong) NSTextField *meetingPromptCountLabel;
+@property(nonatomic, strong) NSTextField *outputFolderSettingLabel;
 @property(nonatomic, strong) NSPopUpButton *languageSettingPopup;
 @property(nonatomic, strong) NSPopUpButton *transcriptionSettingPopup;
 @property(nonatomic, strong) NSPopUpButton *reminderSettingPopup;
+@property(nonatomic, strong) NSScrollView *meetingPromptScrollView;
+@property(nonatomic, strong) NSTextView *meetingPromptTextView;
+@property(nonatomic, strong) NSTextField *outputFolderPathField;
+@property(nonatomic, strong) NSButton *chooseOutputFolderButton;
+@property(nonatomic, strong) NSButton *dailyFolderCheckbox;
 @property(nonatomic, copy) NSString *interfaceLanguage;
 @property(nonatomic, copy) NSString *transcriptionMode;
 @property(nonatomic, copy) NSString *recordingReminderMode;
@@ -1933,6 +2107,9 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
         @"SnackRecordInterfaceLanguage": @"zh",
         @"SnackRecordTranscriptionMode": TranscriptionModeFast,
         @"SnackRecordReminderMode": @"off",
+        SnackRecordMeetingPromptKey: SnackRecordDefaultMeetingPrompt,
+        SnackRecordOutputDirectoryKey: [NSFileManager.defaultManager URLsForDirectory:NSDesktopDirectory inDomains:NSUserDomainMask].firstObject.path,
+        SnackRecordDailyFolderKey: @NO,
     }];
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"SnackRecordChineseDefaultsApplied"]) {
         [NSUserDefaults.standardUserDefaults setObject:@"zh" forKey:@"SnackRecordInterfaceLanguage"];
@@ -2048,7 +2225,7 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
 }
 
 - (void)configureSettingsPanel {
-    self.settingsPanel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 440, 270)
+    self.settingsPanel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 520, 620)
                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                                      backing:NSBackingStoreBuffered
                                                        defer:NO];
@@ -2057,42 +2234,93 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     self.settingsPanel.backgroundColor = AppBackground();
     NSView *view = self.settingsPanel.contentView;
 
-    self.settingsTitleLabel = [NSTextField labelWithString:@"Menu bar settings"];
-    self.settingsTitleLabel.frame = NSMakeRect(24, 214, 392, 28);
+    self.settingsTitleLabel = [NSTextField labelWithString:@"Settings"];
+    self.settingsTitleLabel.frame = NSMakeRect(24, 564, 472, 28);
     self.settingsTitleLabel.font = [NSFont systemFontOfSize:20 weight:NSFontWeightSemibold];
     self.settingsTitleLabel.textColor = NSColor.labelColor;
     [view addSubview:self.settingsTitleLabel];
 
-    self.settingsDescriptionLabel = [NSTextField labelWithString:@"Changes also apply to the menu bar immediately."];
-    self.settingsDescriptionLabel.frame = NSMakeRect(24, 190, 392, 20);
+    self.settingsDescriptionLabel = [NSTextField labelWithString:@"Changes are saved automatically."];
+    self.settingsDescriptionLabel.frame = NSMakeRect(24, 540, 472, 20);
     self.settingsDescriptionLabel.font = [NSFont systemFontOfSize:12];
     self.settingsDescriptionLabel.textColor = NSColor.secondaryLabelColor;
     [view addSubview:self.settingsDescriptionLabel];
 
-    self.languageSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 145, 142, 25)];
-    self.transcriptionSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 96, 142, 25)];
-    self.reminderSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 47, 142, 25)];
+    self.languageSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 493, 142, 25)];
+    self.transcriptionSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 447, 142, 25)];
+    self.reminderSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 401, 142, 25)];
     [view addSubview:self.languageSettingLabel];
     [view addSubview:self.transcriptionSettingLabel];
     [view addSubview:self.reminderSettingLabel];
 
-    self.languageSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 140, 244, 32) pullsDown:NO];
+    self.languageSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 488, 324, 32) pullsDown:NO];
     [self.languageSettingPopup addItemsWithTitles:@[@"中文", @"English"]];
     self.languageSettingPopup.target = self;
     self.languageSettingPopup.action = @selector(changeLanguageFromSettings:);
     [view addSubview:self.languageSettingPopup];
 
-    self.transcriptionSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 91, 244, 32) pullsDown:NO];
+    self.transcriptionSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 442, 324, 32) pullsDown:NO];
     [self.transcriptionSettingPopup addItemsWithTitles:@[@"Fast transcription", @"Standard transcription"]];
     self.transcriptionSettingPopup.target = self;
     self.transcriptionSettingPopup.action = @selector(changeTranscriptionFromSettings:);
     [view addSubview:self.transcriptionSettingPopup];
 
-    self.reminderSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 42, 244, 32) pullsDown:NO];
+    self.reminderSettingPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(172, 396, 324, 32) pullsDown:NO];
     [self.reminderSettingPopup addItemsWithTitles:@[@"Off", @"Automatic reminders"]];
     self.reminderSettingPopup.target = self;
     self.reminderSettingPopup.action = @selector(changeReminderFromSettings:);
     [view addSubview:self.reminderSettingPopup];
+
+    NSBox *separator = [[NSBox alloc] initWithFrame:NSMakeRect(24, 371, 472, 1)];
+    separator.boxType = NSBoxSeparator;
+    [view addSubview:separator];
+
+    self.meetingPromptSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 337, 300, 25)];
+    [view addSubview:self.meetingPromptSettingLabel];
+
+    self.meetingPromptCountLabel = [NSTextField labelWithString:@""];
+    self.meetingPromptCountLabel.frame = NSMakeRect(350, 337, 146, 20);
+    self.meetingPromptCountLabel.alignment = NSTextAlignmentRight;
+    self.meetingPromptCountLabel.font = [NSFont systemFontOfSize:11];
+    self.meetingPromptCountLabel.textColor = NSColor.secondaryLabelColor;
+    [view addSubview:self.meetingPromptCountLabel];
+
+    self.meetingPromptScrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(24, 228, 472, 100)];
+    self.meetingPromptScrollView.borderType = NSBezelBorder;
+    self.meetingPromptScrollView.hasVerticalScroller = YES;
+    self.meetingPromptScrollView.autohidesScrollers = YES;
+    self.meetingPromptTextView = [[NSTextView alloc] initWithFrame:self.meetingPromptScrollView.contentView.bounds];
+    self.meetingPromptTextView.delegate = self;
+    self.meetingPromptTextView.font = [NSFont systemFontOfSize:13];
+    self.meetingPromptTextView.textContainerInset = NSMakeSize(7, 7);
+    self.meetingPromptTextView.verticallyResizable = YES;
+    self.meetingPromptTextView.horizontallyResizable = NO;
+    self.meetingPromptTextView.autoresizingMask = NSViewWidthSizable;
+    self.meetingPromptTextView.textContainer.widthTracksTextView = YES;
+    self.meetingPromptScrollView.documentView = self.meetingPromptTextView;
+    [view addSubview:self.meetingPromptScrollView];
+
+    self.outputFolderSettingLabel = [self settingsLabelWithFrame:NSMakeRect(24, 188, 472, 25)];
+    [view addSubview:self.outputFolderSettingLabel];
+
+    self.outputFolderPathField = [[NSTextField alloc] initWithFrame:NSMakeRect(24, 148, 370, 28)];
+    self.outputFolderPathField.editable = NO;
+    self.outputFolderPathField.selectable = YES;
+    self.outputFolderPathField.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    self.outputFolderPathField.font = [NSFont systemFontOfSize:12];
+    [view addSubview:self.outputFolderPathField];
+
+    self.chooseOutputFolderButton = [[NSButton alloc] initWithFrame:NSMakeRect(404, 146, 92, 32)];
+    self.chooseOutputFolderButton.bezelStyle = NSBezelStyleRounded;
+    self.chooseOutputFolderButton.target = self;
+    self.chooseOutputFolderButton.action = @selector(chooseOutputFolder:);
+    [view addSubview:self.chooseOutputFolderButton];
+
+    self.dailyFolderCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(24, 101, 472, 28)];
+    self.dailyFolderCheckbox.buttonType = NSButtonTypeSwitch;
+    self.dailyFolderCheckbox.target = self;
+    self.dailyFolderCheckbox.action = @selector(toggleDailyFolder:);
+    [view addSubview:self.dailyFolderCheckbox];
 
     [self updateSettingsPanel];
 }
@@ -2101,11 +2329,15 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     if (!self.settingsPanel) return;
     BOOL chinese = [self isChineseInterface];
     self.settingsPanel.title = chinese ? @"设置" : @"Settings";
-    self.settingsTitleLabel.stringValue = chinese ? @"菜单栏设置" : @"Menu bar settings";
-    self.settingsDescriptionLabel.stringValue = chinese ? @"修改后会立即同步到顶部菜单栏。" : @"Changes also apply to the menu bar immediately.";
+    self.settingsTitleLabel.stringValue = chinese ? @"设置" : @"Settings";
+    self.settingsDescriptionLabel.stringValue = chinese ? @"修改会自动保存，并立即生效。" : @"Changes are saved automatically and apply immediately.";
     self.languageSettingLabel.stringValue = chinese ? @"界面语言" : @"Language";
     self.transcriptionSettingLabel.stringValue = chinese ? @"转写模式" : @"Transcription mode";
     self.reminderSettingLabel.stringValue = chinese ? @"录音提醒" : @"Recording reminders";
+    self.meetingPromptSettingLabel.stringValue = chinese ? @"会议纪要 Prompt（最多 600 字）" : @"Meeting notes prompt (600 characters max)";
+    self.outputFolderSettingLabel.stringValue = chinese ? @"转写文件保存位置" : @"Transcript output folder";
+    self.chooseOutputFolderButton.title = chinese ? @"选择…" : @"Choose…";
+    self.dailyFolderCheckbox.title = chinese ? @"每天按日期新建文件夹并保存当天转写" : @"Create one dated folder per day for transcripts";
     [self.transcriptionSettingPopup itemAtIndex:0].title = chinese ? @"快速转写（不区分说话人）" : @"Fast transcription (no speakers)";
     [self.transcriptionSettingPopup itemAtIndex:1].title = chinese ? @"标准转写（区分说话人）" : @"Standard transcription (speakers)";
     [self.reminderSettingPopup itemAtIndex:0].title = chinese ? @"不提醒" : @"Off";
@@ -2113,6 +2345,49 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     [self.languageSettingPopup selectItemAtIndex:chinese ? 0 : 1];
     [self.transcriptionSettingPopup selectItemAtIndex:[self.transcriptionMode isEqualToString:TranscriptionModeStandard] ? 1 : 0];
     [self.reminderSettingPopup selectItemAtIndex:[self.recordingReminderMode isEqualToString:@"automatic"] ? 1 : 0];
+    NSString *prompt = [NSUserDefaults.standardUserDefaults stringForKey:SnackRecordMeetingPromptKey] ?: SnackRecordDefaultMeetingPrompt;
+    if (![self.settingsPanel.firstResponder isEqual:self.meetingPromptTextView]) self.meetingPromptTextView.string = prompt;
+    self.meetingPromptCountLabel.stringValue = [NSString stringWithFormat:@"%lu / 600", (unsigned long)prompt.length];
+    self.outputFolderPathField.stringValue = [NSUserDefaults.standardUserDefaults stringForKey:SnackRecordOutputDirectoryKey] ?: @"";
+    self.outputFolderPathField.toolTip = self.outputFolderPathField.stringValue;
+    self.dailyFolderCheckbox.state = [NSUserDefaults.standardUserDefaults boolForKey:SnackRecordDailyFolderKey]
+        ? NSControlStateValueOn
+        : NSControlStateValueOff;
+}
+
+- (BOOL)textView:(NSTextView *)textView
+shouldChangeTextInRange:(NSRange)affectedCharRange
+ replacementString:(NSString *)replacementString {
+    if (textView != self.meetingPromptTextView) return YES;
+    NSUInteger nextLength = textView.string.length - affectedCharRange.length + replacementString.length;
+    return nextLength <= 600;
+}
+
+- (void)textDidChange:(NSNotification *)notification {
+    if (notification.object != self.meetingPromptTextView) return;
+    NSString *prompt = self.meetingPromptTextView.string;
+    [NSUserDefaults.standardUserDefaults setObject:prompt forKey:SnackRecordMeetingPromptKey];
+    self.meetingPromptCountLabel.stringValue = [NSString stringWithFormat:@"%lu / 600", (unsigned long)prompt.length];
+}
+
+- (void)chooseOutputFolder:(id)sender {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseFiles = NO;
+    panel.canChooseDirectories = YES;
+    panel.allowsMultipleSelection = NO;
+    panel.canCreateDirectories = YES;
+    NSString *currentPath = [NSUserDefaults.standardUserDefaults stringForKey:SnackRecordOutputDirectoryKey];
+    if (currentPath.length > 0) panel.directoryURL = [NSURL fileURLWithPath:currentPath isDirectory:YES];
+    __weak typeof(self) weakSelf = self;
+    [panel beginSheetModalForWindow:self.settingsPanel completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK || !panel.URL) return;
+        [NSUserDefaults.standardUserDefaults setObject:panel.URL.path forKey:SnackRecordOutputDirectoryKey];
+        [weakSelf updateSettingsPanel];
+    }];
+}
+
+- (void)toggleDailyFolder:(NSButton *)sender {
+    [NSUserDefaults.standardUserDefaults setBool:sender.state == NSControlStateValueOn forKey:SnackRecordDailyFolderKey];
 }
 
 - (void)showSettings {
@@ -2276,7 +2551,10 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return NO; }
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag { [self.controller showWindow]; return NO; }
-- (void)applicationDidBecomeActive:(NSNotification *)notification { [self.controller refreshMicrophoneAuthorization]; }
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    [self.controller refreshMicrophoneAuthorization];
+    [self.controller refreshIntegrationAvailability];
+}
 - (void)applicationWillTerminate:(NSNotification *)notification {
     if (self.shortcutMonitor) [NSEvent removeMonitor:self.shortcutMonitor];
     if (self.recordingHotKey) UnregisterEventHotKey(self.recordingHotKey);
