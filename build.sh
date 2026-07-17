@@ -5,7 +5,8 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT/build"
 APP="$BUILD_DIR/Snack Record.app"
 if [[ -z "${SIGN_IDENTITY:-}" ]]; then
-  if security find-identity -v -p codesigning 2>/dev/null | /usr/bin/grep -Fq '"Snack Record Local Code Signing"'; then
+  SIGNING_IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  if print -r -- "$SIGNING_IDENTITIES" | /usr/bin/grep -F '"Snack Record Local Code Signing"' >/dev/null; then
     SIGN_IDENTITY="Snack Record Local Code Signing"
   else
     SIGN_IDENTITY="-"
