@@ -5,12 +5,11 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT/build"
 APP="$BUILD_DIR/Snack Record.app"
 if [[ -z "${SIGN_IDENTITY:-}" ]]; then
-  SIGNING_IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
-  if print -r -- "$SIGNING_IDENTITIES" | /usr/bin/grep -F '"Snack Record Local Code Signing"' >/dev/null; then
-    SIGN_IDENTITY="Snack Record Local Code Signing"
-  else
-    SIGN_IDENTITY="-"
-  fi
+  SIGN_IDENTITY="$(zsh "$ROOT/scripts/ensure_local_signing_identity.sh")"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  echo "A stable signing identity is required. Set SIGN_IDENTITY=- only for disposable builds." >&2
+  exit 1
 fi
 
 rm -rf "$APP"

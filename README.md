@@ -20,11 +20,11 @@ Local macOS meeting recorder and Chinese transcription app powered by FunASR.
 Ask your AI coding tool to clone this repository, review `install.sh`, and run:
 
 ```bash
-chmod +x install.sh build.sh scripts/download_models.py
+chmod +x install.sh build.sh scripts/download_models.py scripts/ensure_local_signing_identity.sh
 ./install.sh
 ```
 
-The installer builds the app on the current Mac and uses ad-hoc signing. It does not require a Developer ID certificate or access to another person's signing identity.
+The installer builds the app on the current Mac and creates a stable, local-only signing identity in a dedicated Snack Record keychain. It does not require an Apple Developer account, a Developer ID certificate, or access to another person's signing identity. The same identity is reused on later builds so macOS privacy permissions remain associated with the app after an update.
 
 The first installation downloads about 2 GB of speech models. The app is installed to:
 
@@ -37,6 +37,14 @@ Runtime files and models are stored under:
 ```text
 ~/Library/Application Support/Snack Record/
 ```
+
+The local signing keychain and its randomly generated password are stored under:
+
+```text
+~/Library/Application Support/Snack Record/Signing/
+```
+
+The signing key is generated on the current Mac, is not uploaded, and has no connection to the repository owner.
 
 ## Requirements
 
@@ -59,7 +67,9 @@ See [PRIVACY.md](PRIVACY.md) for storage locations and deletion behavior.
 
 ## Signing
 
-`install.sh` uses ad-hoc signing for source-based local installation. Privacy permissions may need to be granted again after rebuilding or updating the app. A Developer ID certificate is required only when distributing a prebuilt app or DMG that should pass Gatekeeper normally.
+`install.sh` creates and reuses a local code-signing identity for source-based installation. Existing users upgrading from an older ad-hoc-signed build must grant microphone and screen/system-audio permissions one final time after the migration. Later source updates keep the same designated requirement and should not reset those permissions.
+
+Set `SIGN_IDENTITY` to a Developer ID identity when producing a signed release. `SIGN_IDENTITY=-` remains available only for disposable development builds; ad-hoc builds are not suitable for upgrades because macOS binds privacy permissions to their changing code hash.
 
 ## Third-party models
 

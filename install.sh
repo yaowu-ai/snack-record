@@ -11,6 +11,7 @@ DEST_APP="$INSTALL_DIR/Snack Record.app"
 
 command -v xcrun >/dev/null || { echo "Install Xcode Command Line Tools first: xcode-select --install"; exit 1; }
 command -v python3 >/dev/null || { echo "Python 3 is required."; exit 1; }
+command -v security >/dev/null || { echo "The macOS security command is required."; exit 1; }
 
 if ! command -v ffmpeg >/dev/null; then
   if command -v brew >/dev/null; then
@@ -29,7 +30,7 @@ python3 -m venv "$VENV_DIR"
 echo "Downloading local speech models (about 2 GB on first install)..."
 MODELSCOPE_CACHE="$MODELS_DIR" "$VENV_DIR/bin/python" "$ROOT/scripts/download_models.py"
 
-SIGN_IDENTITY=- zsh "$ROOT/build.sh"
+zsh "$ROOT/build.sh"
 rm -rf "$DEST_APP"
 ditto "$ROOT/build/Snack Record.app" "$DEST_APP"
 open "$DEST_APP"
