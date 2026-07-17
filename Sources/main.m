@@ -13,6 +13,7 @@ static NSString *const SnackRecordOutputDirectoryKey = @"SnackRecordOutputDirect
 static NSString *const SnackRecordDailyFolderKey = @"SnackRecordDailyFolder";
 static NSString *const SnackRecordDefaultMeetingPrompt = @"调用会议纪要 skill 帮我结构化总结下面这段会议转写，不超过 600 字。";
 static NSString *const SnackRecordHandoffMetadataType = @"cn.yaowutech.snack.record-handoff+json";
+static NSString *const SnackDesktopGitHubURL = @"https://github.com/yaowu-ai/snack-desktop";
 static const NSUInteger SnackRecordMaximumHandoffBytes = 5 * 1024 * 1024;
 
 static NSURL *SnackRecordApplicationSupportURL(void) {
@@ -178,6 +179,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, strong) NSScrollView *jobsScrollView;
 @property(nonatomic, strong) FlippedView *jobsDocumentView;
 @property(nonatomic, strong) NSPanel *recordingPanel;
+@property(nonatomic, strong) NSPanel *toastPanel;
 @property(nonatomic, strong) NSTextField *recordingTimerLabel;
 @property(nonatomic, strong) NSTextField *recordingTitleLabel;
 @property(nonatomic, strong) NSTimer *recordingTimer;
@@ -1282,7 +1284,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.revealButton.toolTip = [self english:@"Open transcript" chinese:@"打开转写文件"];
     job.revealButton.contentTintColor = BrandOrange();
     job.revealButton.tag = [self.jobs indexOfObjectIdenticalTo:job];
-    job.revealButton.frame = NSMakeRect(rowWidth - 54, 31, 34, 30);
+    job.revealButton.frame = NSMakeRect(rowWidth - 94, 31, 34, 30);
     job.revealButton.autoresizingMask = NSViewMinXMargin;
     [job.rowView addSubview:job.revealButton];
 
@@ -1292,17 +1294,17 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.retryButton.toolTip = [self english:@"Transcribe again" chinese:@"重新转写"];
     job.retryButton.contentTintColor = NSColor.systemBlueColor;
     job.retryButton.identifier = job.identifier;
-    job.retryButton.frame = NSMakeRect(rowWidth - 94, 31, 34, 30);
+    job.retryButton.frame = NSMakeRect(rowWidth - 134, 31, 34, 30);
     job.retryButton.autoresizingMask = NSViewMinXMargin;
     [job.rowView addSubview:job.retryButton];
 
-    job.meetingNotesButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"list.bullet.clipboard" accessibilityDescription:@"生成会议纪要"] target:self action:@selector(createMeetingNotes:)];
+    job.meetingNotesButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:@"生成会议纪要"] target:self action:@selector(createMeetingNotes:)];
     job.meetingNotesButton.bezelStyle = NSBezelStyleTexturedRounded;
     job.meetingNotesButton.imagePosition = NSImageOnly;
     job.meetingNotesButton.toolTip = [self english:@"Create meeting notes in Snack" chinese:@"在 Snack 中生成会议纪要"];
     job.meetingNotesButton.contentTintColor = NSColor.systemBlueColor;
     job.meetingNotesButton.identifier = job.identifier;
-    job.meetingNotesButton.frame = NSMakeRect(rowWidth - 134, 31, 34, 30);
+    job.meetingNotesButton.frame = NSMakeRect(rowWidth - 54, 31, 34, 30);
     job.meetingNotesButton.autoresizingMask = NSViewMinXMargin;
     [job.rowView addSubview:job.meetingNotesButton];
     [self updateJobRow:job];
@@ -1390,6 +1392,69 @@ static NSString *const TranscriptionModeStandard = @"standard";
     [alert beginSheetModalForWindow:self.window completionHandler:nil];
 }
 
+- (void)showToast:(NSString *)message {
+    [self.toastPanel orderOut:nil];
+
+    NSRect windowFrame = self.window.frame;
+    NSSize size = NSMakeSize(190, 42);
+    NSRect frame = NSMakeRect(NSMidX(windowFrame) - size.width / 2.0,
+                              NSMinY(windowFrame) + 54,
+                              size.width,
+                              size.height);
+    NSPanel *panel = [[NSPanel alloc] initWithContentRect:frame
+                                                styleMask:NSWindowStyleMaskBorderless
+                                                  backing:NSBackingStoreBuffered
+                                                    defer:NO];
+    panel.opaque = NO;
+    panel.backgroundColor = NSColor.clearColor;
+    panel.hasShadow = YES;
+    panel.level = NSFloatingWindowLevel;
+    panel.ignoresMouseEvents = YES;
+    panel.collectionBehavior = NSWindowCollectionBehaviorTransient | NSWindowCollectionBehaviorMoveToActiveSpace;
+
+    NSVisualEffectView *background = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, size.width, size.height)];
+    background.material = NSVisualEffectMaterialHUDWindow;
+    background.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    background.state = NSVisualEffectStateActive;
+    background.wantsLayer = YES;
+    background.layer.cornerRadius = 8;
+    background.layer.masksToBounds = YES;
+
+    NSTextField *label = [NSTextField labelWithString:message];
+    label.frame = NSMakeRect(12, 11, size.width - 24, 20);
+    label.alignment = NSTextAlignmentCenter;
+    label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    label.textColor = NSColor.whiteColor;
+    [background addSubview:label];
+    panel.contentView = background;
+
+    self.toastPanel = panel;
+    [panel orderFrontRegardless];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (weakSelf.toastPanel != panel) return;
+        [panel orderOut:nil];
+        weakSelf.toastPanel = nil;
+    });
+}
+
+- (void)showSnackInstallationPrompt {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleInformational;
+    alert.messageText = [self english:@"Snack Desktop is required" chinese:@"需要安装 Snack.app"];
+    alert.informativeText = [self english:@"Install Snack Desktop to generate meeting notes from a transcript."
+                                     chinese:@"安装 Snack 桌面端后，才能将转写文本自动生成会议纪要。"];
+    [alert addButtonWithTitle:[self english:@"Copy GitHub address" chinese:@"复制 GitHub 地址"]];
+    [alert addButtonWithTitle:[self english:@"Not now" chinese:@"暂不安装"]];
+    __weak typeof(self) weakSelf = self;
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse returnCode) {
+        if (returnCode != NSAlertFirstButtonReturn) return;
+        [NSPasteboard.generalPasteboard clearContents];
+        [NSPasteboard.generalPasteboard setString:SnackDesktopGitHubURL forType:NSPasteboardTypeString];
+        [weakSelf showToast:[weakSelf english:@"GitHub address copied" chinese:@"GitHub 地址已复制"]];
+    }];
+}
+
 - (void)createMeetingNotes:(NSButton *)sender {
     TranscriptionJob *job = nil;
     for (TranscriptionJob *candidate in self.jobs) {
@@ -1400,8 +1465,12 @@ static NSString *const TranscriptionModeStandard = @"standard";
     }
     NSURL *snackURL = [self snackApplicationURL];
     BOOL outputAvailable = job.finalOutputURL && [NSFileManager.defaultManager fileExistsAtPath:job.finalOutputURL.path];
-    if (!job || job.state != TranscriptionJobStateFinished || !outputAvailable || !snackURL) {
+    if (!job || job.state != TranscriptionJobStateFinished || !outputAvailable) {
         [self refreshIntegrationAvailability];
+        return;
+    }
+    if (!snackURL) {
+        [self showSnackInstallationPrompt];
         return;
     }
 
@@ -1507,14 +1576,14 @@ static NSString *const TranscriptionModeStandard = @"standard";
     job.revealButton.toolTip = outputAvailable
         ? [self english:@"Open transcript" chinese:@"打开转写文件"]
         : [self english:@"File not found" chinese:@"文件未找到"];
-    job.meetingNotesButton.enabled = job.state == TranscriptionJobStateFinished && outputAvailable && snackAvailable;
+    job.meetingNotesButton.enabled = job.state == TranscriptionJobStateFinished && outputAvailable;
     job.meetingNotesButton.contentTintColor = job.meetingNotesButton.enabled ? NSColor.systemBlueColor : NSColor.tertiaryLabelColor;
     if (job.state != TranscriptionJobStateFinished) {
         job.meetingNotesButton.toolTip = [self english:@"Available after transcription completes" chinese:@"转写完成后可生成会议纪要"];
     } else if (!outputAvailable) {
         job.meetingNotesButton.toolTip = [self english:@"Transcript file not found" chinese:@"转写文件未找到"];
     } else if (!snackAvailable) {
-        job.meetingNotesButton.toolTip = [self english:@"Snack Desktop not found" chinese:@"未检测到 Snack 桌面端"];
+        job.meetingNotesButton.toolTip = [self english:@"Install Snack Desktop to create meeting notes" chinese:@"安装 Snack 桌面端后生成会议纪要"];
     } else {
         job.meetingNotesButton.toolTip = [self english:@"Create meeting notes in Snack" chinese:@"在 Snack 中生成会议纪要"];
     }
