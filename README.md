@@ -24,7 +24,9 @@ chmod +x install.sh build.sh scripts/download_models.py scripts/ensure_local_sig
 ./install.sh
 ```
 
-The installer builds the app on the current Mac and creates a stable, local-only signing identity in a dedicated Snack Record keychain. It does not require an Apple Developer account, a Developer ID certificate, or access to another person's signing identity. The same identity is reused on later builds so macOS privacy permissions remain associated with the app after an update.
+The installer builds a native app for the current Mac (Apple Silicon or Intel) and creates a stable, local-only signing identity in a dedicated Snack Record keychain. It does not require an Apple Developer account, a Developer ID certificate, or access to another person's signing identity. The same identity is reused on later builds so macOS privacy permissions remain associated with the app after an update.
+
+On Intel Macs, the installer selects a native Python 3.10-3.12 runtime and uses the last PyTorch release that provides x86_64 macOS wheels. If no compatible Python is installed, Homebrew is used to install Python 3.11. Set `SNACK_RECORD_PYTHON` to a compatible Python executable to override automatic selection.
 
 The first installation downloads about 2 GB of speech models. The app is installed to:
 
@@ -48,10 +50,10 @@ The signing key is generated on the current Mac, is not uploaded, and has no con
 
 ## Requirements
 
-- macOS 15 or later recommended
-- Apple Silicon Mac
+- macOS 13 or later (macOS 15 or later recommended)
+- Apple Silicon or Intel Mac
 - Xcode Command Line Tools
-- Python 3
+- Python 3.10 or later (Intel requires Python 3.10-3.12)
 - Homebrew and FFmpeg
 - Internet connection during first installation
 
