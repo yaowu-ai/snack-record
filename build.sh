@@ -28,7 +28,7 @@ cp "$ROOT/funasr_transcribe.py" "$APP/Contents/Resources/funasr_transcribe.py"
 cp "$ROOT/Assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/Assets/SnackLogo.png" "$APP/Contents/Resources/SnackLogo.png"
 
-clang -arch "$ARCH" -mmacosx-version-min="$DEPLOYMENT_TARGET" -fobjc-arc "$ROOT/Sources/main.m" \
+clang -arch "$ARCH" -mmacosx-version-min="$DEPLOYMENT_TARGET" -fobjc-arc "$ROOT/Sources/main.m" "$ROOT/Sources/SnackRecordingActivity.m" \
   -framework Cocoa \
   -framework AVFoundation \
   -framework AudioToolbox \

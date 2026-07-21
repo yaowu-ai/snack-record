@@ -6,6 +6,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <UserNotifications/UserNotifications.h>
 #import <CommonCrypto/CommonDigest.h>
+#import "SnackRecordingActivity.h"
 #include <math.h>
 
 static NSString *const SnackRecordMeetingPromptKey = @"SnackRecordMeetingPrompt";
@@ -231,6 +232,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic) BOOL finalizingMeetingAudio;
 @property(nonatomic, strong) NSURL *recordingURL;
 @property(nonatomic, strong) NSDate *recordingStartDate;
+@property(nonatomic, strong) id<NSObject> recordingActivity;
 @property(nonatomic, strong) NSMutableArray<TranscriptionJob *> *jobs;
 @property(nonatomic, strong) NSURL *storageDirectory;
 @property(nonatomic, strong) NSURL *recordingsDirectory;
@@ -249,6 +251,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 - (void)startRecordingIfNeeded;
 - (void)stopRecordingIfNeeded;
 - (void)refreshMicrophoneAuthorization;
+- (BOOL)hasActiveWork;
 - (BOOL)hasPendingTranscriptions;
 - (void)cancelTranscriptions;
 - (void)applyInterfaceLanguage:(NSString *)language;
@@ -859,6 +862,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
         [self renderState:TranscriptionStateFailed message:[self english:@"Unable to start recording" chinese:@"无法开始录音"]];
         return;
     }
+    self.recordingActivity = SnackRecordBeginRecordingActivity((id<SnackRecordingActivityManaging>)NSProcessInfo.processInfo);
     self.recordingStartDate = NSDate.date;
     [self renderState:TranscriptionStateRecording message:nil];
 }
@@ -867,6 +871,8 @@ static NSString *const TranscriptionModeStandard = @"standard";
     NSURL *microphoneURL = self.recordingURL;
     NSDate *startDate = self.recordingStartDate ?: NSDate.date;
     BOOL wasMeetingRecording = self.recordingMeetingAudio;
+    SnackRecordEndRecordingActivity((id<SnackRecordingActivityManaging>)NSProcessInfo.processInfo, self.recordingActivity);
+    self.recordingActivity = nil;
     [self.audioEngine.inputNode removeTapOnBus:0];
     [self.audioEngine stop];
     self.audioFile = nil;
@@ -1722,6 +1728,10 @@ static NSString *const TranscriptionModeStandard = @"standard";
         if (!job.cancelled && (job.state == TranscriptionJobStateQueued || job.state == TranscriptionJobStateProcessing)) return YES;
     }
     return NO;
+}
+
+- (BOOL)hasActiveWork {
+    return SnackRecordShouldProtectActiveWork(self.audioEngine.isRunning, self.finalizingMeetingAudio, [self hasPendingTranscriptions]);
 }
 
 - (void)cancelTranscriptions {
@@ -2671,12 +2681,12 @@ shouldChangeTextInRange:(NSRange)affectedCharRange
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
-    if (![self.controller hasPendingTranscriptions]) return NSTerminateNow;
+    if (![self.controller hasActiveWork]) return NSTerminateNow;
     BOOL chinese = [self isChineseInterface];
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleWarning;
-    alert.messageText = chinese ? @"仍有转写任务正在处理" : @"Transcription is still in progress";
-    alert.informativeText = chinese ? @"现在退出会中断尚未完成的转写，相关文本可能不会保存。" : @"Quitting now will interrupt unfinished tasks and their transcripts may not be saved.";
+    alert.messageText = chinese ? @"录制或转写仍在进行" : @"Recording or transcription is still in progress";
+    alert.informativeText = chinese ? @"现在退出会中断尚未完成的录制或转写，相关音频和文本可能不会保存。" : @"Quitting now will interrupt unfinished recording or transcription work, and related audio or transcripts may not be saved.";
     [alert addButtonWithTitle:chinese ? @"继续处理" : @"Keep processing"];
     [alert addButtonWithTitle:chinese ? @"退出" : @"Quit"];
     if ([alert runModal] == NSAlertSecondButtonReturn) {
